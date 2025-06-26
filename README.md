@@ -4,21 +4,23 @@ Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ 
 
 ## Tính năng
 
-- **Hiệu năng cực cao**: Tối ưu với thread pool, CPU affinity và lock-free data structures
+- **Hiệu năng cực cao**: Tối ưu với thread pool, CPU affinity đa nền tảng và cấu trúc dữ liệu lock-free
 - **Đảm bảo thứ tự tuần tự**: Duy trì thứ tự chính xác của các packet trên mỗi port
 - **Buffer riêng cho từng port**: Ring buffer riêng biệt cho mỗi port đảm bảo thông lượng tối đa
-- **Rate limiting**: Điều chỉnh tốc độ gửi packet tự động hoặc thủ công
-- **Port mapping**: Khả năng ánh xạ các port đích sang port mới
-- **Hỗ trợ multicast**: Tùy chọn gửi đến địa chỉ multicast
+- **Auto-scaling thread**: Tự động điều chỉnh số lượng thread dựa trên số port phát hiện được
+- **Hỗ trợ multicast tích hợp**: Tự động cấu hình cho địa chỉ UDP multicast
+- **Rate limiting**: Điều chỉnh tốc độ gửi packet tự động theo PCAP gốc hoặc tốc độ cố định
 - **Chế độ loop**: Phát lại liên tục file PCAP
-- **Phân tích PCAP**: Tự động phát hiện các port, tốc độ và thông tin khác
+- **Thống kê chi tiết**: Báo cáo tiến trình, tốc độ và tổng kết khi hoàn thành
+- **Tương thích đa nền tảng**: Hỗ trợ CPU affinity trên các hệ điều hành khác nhau
 
 ## Kiến trúc
 
 - **Per-port ring buffer**: Mỗi port có một hàng đợi riêng để đảm bảo thứ tự tuần tự tuyệt đối trên từng port
 - **Thread pool tối ưu**: Tự động điều chỉnh số lượng thread dựa trên số port phát hiện được
-- **CPU affinity** (chỉ trên Linux): Gắn mỗi worker thread vào CPU core cụ thể để tăng hiệu năng
+- **CPU affinity đa nền tảng**: Phát hiện và gắn thread với CPU core trên các hệ điều hành hỗ trợ
 - **Cấu trúc dữ liệu lock-free**: Sử dụng crossbeam và dashmap để giảm thiểu tranh chấp giữa các thread
+- **Báo cáo thông minh**: Hiển thị tiến trình, tốc độ và phân tích hiệu suất trong thời gian thực
 
 ## Cài đặt
 
@@ -26,7 +28,6 @@ Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ 
 
 - Rust 2024 Edition
 - libpcap-dev (hoặc tương đương trên hệ điều hành của bạn)
-- Core affinity API (Linux: hwloc, Windows: WinAPI, macOS: thread_policy_set)
 
 ```bash
 # Cài đặt libpcap
@@ -65,89 +66,75 @@ cboe-sequential-replayer [OPTIONS] --file <FILE> --target <TARGET>
 ### Tham số bắt buộc
 
 - `-f, --file <FILE>`: Đường dẫn tới file PCAP
-- `-t, --target <TARGET>`: Địa chỉ IP đích
+- `-t, --target <TARGET>`: Địa chỉ IP đích (hỗ trợ multicast tự động)
 
 ### Tham số tùy chọn
 
 - `-r, --rate <RATE>`: Tốc độ giới hạn theo số packet mỗi giây (không chỉ định: phát lại theo đúng timing trong PCAP gốc)
-- `--port-map <PORT_MAP>`: Ánh xạ port "old1:new1,old2:new2" (tùy chọn)
-- `-m, --multicast`: Bật chế độ multicast UDP
-- `--interface <INTERFACE>`: Interface cho multicast (tùy chọn)
 - `--loop`: Lặp lại liên tục
-- `-n, --threads <THREADS>`: Số lượng worker threads (mặc định: tự động dựa trên số port phát hiện được)
-- `-v, --verbose`: Bật ghi log chi tiết
 
 ### Ví dụ
 
-#### Chạy với nhiều worker threads để tối đa hiệu năng:
+#### Phát lại với timing gốc:
 
 ```bash
-cargo run --release -- -f market_data.pcap -t 127.0.0.1 -n 8
+./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100
 ```
 
-#### Ánh xạ port:
+#### Phát lại với tốc độ cố định:
 
 ```bash
-./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 --port-map "7123:8123,7124:8124"
+./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 -r 10000
 ```
 
-#### Multicast với interface cụ thể:
+#### Phát lại đến địa chỉ multicast:
 
 ```bash
-./cboe-pcap-replay -f market_data.pcap -t 239.1.1.1 -m --interface 192.168.1.5
+./cboe-pcap-replay -f market_data.pcap -t 239.1.1.1
 ```
 
-#### Lặp lại liên tục với log chi tiết:
+#### Lặp lại liên tục:
 
 ```bash
-./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 --loop -v
+./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 --loop
 ```
 
 ## Quy trình hoạt động
 
 1. **Phân tích file PCAP**: Công cụ đầu tiên quét file để phát hiện các port UDP duy nhất và tính toán tốc độ.
-2. **Phân phối port tối ưu**: Các port được phân phối đều cho các worker thread để cân bằng tải.
-3. **CPU affinity**: Mỗi worker thread được gắn với một CPU core cụ thể để tối ưu hiệu năng.
-4. **Ring buffer cho mỗi port**: Mỗi port có một ring buffer riêng, đảm bảo tính tuần tự của packet trên từng port.
-5. **Xử lý song song**: Các port khác nhau được xử lý song song bởi nhiều thread, trong khi vẫn duy trì thứ tự trên mỗi port.
-6. **Thống kê**: Các số liệu hiệu suất được báo cáo mỗi 5 giây.
+2. **Tự động phân bổ thread**: Số lượng thread được xác định dựa trên số port phát hiện được và số CPU có sẵn.
+3. **Phân phối port tối ưu**: Các port được phân phối đều cho các worker thread để cân bằng tải.
+4. **CPU affinity đa nền tảng**: Mỗi worker thread được gắn với một CPU core nếu hệ điều hành hỗ trợ.
+5. **Ring buffer cho mỗi port**: Mỗi port có một ring buffer riêng, đảm bảo tính tuần tự của packet trên từng port.
+6. **Xử lý song song**: Các port khác nhau được xử lý song song bởi nhiều thread, trong khi vẫn duy trì thứ tự trên mỗi port.
+7. **Thống kê thời gian thực**: Các số liệu hiệu suất được báo cáo mỗi 5 giây với thông tin tiến trình.
+8. **Báo cáo tổng kết**: Khi hoàn thành, công cụ hiển thị báo cáo chi tiết về hiệu suất.
 
 ## Theo dõi hiệu suất
 
 Trong quá trình chạy, công cụ báo cáo các số liệu thống kê mỗi 5 giây:
-- Số packet đã gửi
-- Số byte đã gửi
-- Số lỗi
+- Tiến độ phát lại (phần trăm và số packet)
 - Tốc độ hiện tại (packets/second)
-- Kích thước hàng đợi tổng và trên từng port (nếu có tắc nghẽn)
+- Số byte đã gửi
+- Số lỗi (nếu có)
+- Kích thước hàng đợi (nếu có tắc nghẽn)
 
-## Gỡ lỗi
-
-Để xem thông tin chi tiết hơn về quá trình:
-
-```bash
-./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 -v
-```
+Khi kết thúc, công cụ hiển thị báo cáo tổng kết:
+- Tổng thời gian chạy
+- Số packet đã xử lý
+- Tổng dung lượng đã gửi
+- Tốc độ trung bình
+- Số lần phát lại (nếu ở chế độ loop)
 
 ## Lưu ý hệ điều hành
 
 - **Linux**: Hỗ trợ đầy đủ, bao gồm CPU affinity
-- **Windows**: Hỗ trợ đầy đủ, bao gồm CPU affinity
-- **macOS**: Hỗ trợ đầy đủ ngoại trừ CPU affinity (do hạn chế của hệ điều hành)
+- **Windows**: Hỗ trợ đầy đủ, bao gồm CPU affinity (sử dụng core_affinity chuẩn)
+- **macOS**: Hỗ trợ đầy đủ, CPU affinity tùy thuộc vào phiên bản macOS
 
-## Xử lý trường hợp đặc biệt
+Công cụ tự động phát hiện khả năng hỗ trợ CPU affinity và điều chỉnh phù hợp với từng hệ điều hành.
 
-### Ánh xạ port
-
-Khi cần ánh xạ port từ file PCAP đến port khác trên máy đích, sử dụng tham số `--port-map`:
-
-```bash
-./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 --port-map "7123:8123,7124:8124,7125:8125"
-```
-
-Cú pháp: `"port_cũ_1:port_mới_1,port_cũ_2:port_mới_2,..."`
-
-### Hiệu suất tối ưu
+## Hiệu suất tối ưu
 
 Để đạt hiệu suất tối đa:
 
@@ -155,10 +142,10 @@ Cú pháp: `"port_cũ_1:port_mới_1,port_cũ_2:port_mới_2,..."`
 2. Chạy trên máy có nhiều CPU cores
 3. Đảm bảo network buffer đủ lớn
 4. Cân nhắc tăng giới hạn file descriptor nếu cần: `ulimit -n 65535`
-5. Phát lại theo đúng timing PCAP để tái tạo chính xác các bản tin market data
+5. Đối với dữ liệu market data có tính thời gian quan trọng, sử dụng chế độ timing mặc định
 
 ## Giới hạn
 
 - Chỉ xử lý các packet UDP trong IPv4
-- CPU affinity không hoạt động trên macOS
+- CPU affinity phụ thuộc vào hỗ trợ của hệ điều hành
 - Hàng đợi packet có thể tiêu tốn nhiều bộ nhớ với file PCAP lớn

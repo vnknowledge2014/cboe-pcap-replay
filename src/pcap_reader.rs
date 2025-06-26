@@ -28,13 +28,13 @@ pub struct PcapReader {
 
 impl PcapReader {
     pub fn new(file_path: &str) -> Result<Self> {
-        info!("Opening PCAP file with libpcap: {}", file_path);
+        debug!("Opening PCAP file with libpcap: {}", file_path);
         
         let path = Path::new(file_path);
         let capture = Capture::from_file(path)
             .with_context(|| format!("Failed to open PCAP file: {}", file_path))?;
 
-        info!("PCAP file opened successfully using libpcap");
+        debug!("PCAP file opened successfully using libpcap");
         
         Ok(Self {
             capture,
@@ -57,6 +57,7 @@ impl PcapReader {
         let mut udp_count = 0;
         let mut first_timestamp: Option<f64> = None;
         let mut last_timestamp: Option<f64> = None;
+        let start_time = std::time::Instant::now();
 
         loop {
             match temp_capture.next_packet() {
@@ -105,6 +106,12 @@ impl PcapReader {
 
                     ports.insert(udp.get_destination());
                     udp_count += 1;
+
+                    // Print progress periodically
+                    if packet_count % 1_000_000 == 0 {
+                        info!("Analyzed {} packets so far ({} UDP packets)...", 
+                             packet_count, udp_count);
+                    }
                 }
                 Err(PcapError::NoMorePackets) => break,
                 Err(e) => {
@@ -113,6 +120,9 @@ impl PcapReader {
                 }
             }
         }
+
+        let analysis_time = start_time.elapsed();
+        info!("PCAP analysis completed in {:.2} seconds", analysis_time.as_secs_f64());
 
         // Calculate rate from actual timing
         let duration_seconds = if let (Some(first), Some(last)) = (first_timestamp, last_timestamp) {
@@ -129,13 +139,6 @@ impl PcapReader {
 
         let mut sorted_ports: Vec<u16> = ports.iter().cloned().collect();
         sorted_ports.sort();
-
-        info!("PCAP analysis completed:");
-        info!("  Total packets: {}", packet_count);
-        info!("  UDP packets with payload: {}", udp_count);
-        info!("  Duration: {:.3} seconds", duration_seconds);
-        info!("  Calculated rate: {} packets/second", calculated_rate);
-        info!("  Unique destination ports ({}): {:?}", sorted_ports.len(), sorted_ports);
 
         if sorted_ports.is_empty() {
             warn!("No UDP packets with payload found in PCAP file");

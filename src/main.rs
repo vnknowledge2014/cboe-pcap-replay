@@ -2,15 +2,15 @@ use anyhow::Result;
 use clap::Parser;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use core_affinity::{get_core_ids, set_for_current};
+use core_affinity;
 use num_cpus;
 
 mod packet;
@@ -35,29 +35,9 @@ struct Args {
     #[arg(short, long)]
     rate: Option<u64>,
 
-    /// Port mapping "old1:new1,old2:new2" (optional)
-    #[arg(long)]
-    port_map: Option<String>,
-
-    /// Enable UDP multicast mode
-    #[arg(short, long)]
-    multicast: bool,
-
-    /// Interface for multicast (optional)
-    #[arg(long)]
-    interface: Option<String>,
-
     /// Loop replay indefinitely
     #[arg(long)]
     r#loop: bool,
-
-    /// Number of worker threads (default: auto-configure based on detected ports)
-    #[arg(short = 'n', long)]
-    threads: Option<usize>,
-
-    /// Verbose logging
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 /// Replay mode for packet timing
@@ -73,7 +53,6 @@ enum RateLimiterMode {
 struct PortBasedSender {
     socket: Arc<Socket>,
     target_ip: IpAddr,
-    port_map: Arc<HashMap<u16, u16>>,
     // Lock-free port queues - one queue per port
     port_queues: Arc<DashMap<u16, Arc<SegQueue<PacketData>>>>,
     // Track ports assigned to each worker thread
@@ -89,6 +68,7 @@ struct Stats {
     sent_packets: AtomicU64,
     sent_bytes: AtomicU64,
     errors: AtomicU64,
+    total_packets: AtomicU64,
 }
 
 /// High-precision rate limiter for proper packet timing
@@ -173,10 +153,7 @@ impl PortRateLimiter {
 impl PortBasedSender {
     fn new(
         target_ip: IpAddr,
-        port_map: HashMap<u16, u16>,
         rate: Option<u64>,
-        multicast: bool,
-        interface: Option<&str>,
         worker_count: usize,
     ) -> Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -186,15 +163,26 @@ impl PortBasedSender {
             warn!("Failed to set send buffer: {}", e);
         }
         
-        // Configure multicast if enabled
-        if multicast && target_ip.is_ipv4() {
+        // Always configure for multicast
+        if target_ip.is_ipv4() {
             if let IpAddr::V4(addr) = target_ip {
                 if addr.is_multicast() {
                     socket.set_multicast_ttl_v4(64)?;
-                    if let Some(iface) = interface {
-                        let local_addr: Ipv4Addr = iface.parse()?;
-                        socket.set_multicast_if_v4(&local_addr)?;
+                    
+                    // Try to find the best interface for multicast
+                    let interfaces = pnet::datalink::interfaces();
+                    let default_iface = interfaces.iter()
+                        .find(|iface| iface.is_up() && !iface.is_loopback() && !iface.ips.is_empty());
+                    
+                    if let Some(iface) = default_iface {
+                        if let Some(ipv4) = iface.ips.iter().find(|ip| ip.is_ipv4()) {
+                            if let IpAddr::V4(local_addr) = ipv4.ip() {
+                                socket.set_multicast_if_v4(&local_addr)?;
+                                info!("Using interface {} (IP: {}) for multicast", iface.name, local_addr);
+                            }
+                        }
                     }
+                    
                     info!("Configured for UDP multicast to {}", addr);
                 }
             }
@@ -208,7 +196,6 @@ impl PortBasedSender {
         Ok(Self {
             socket: Arc::new(socket),
             target_ip,
-            port_map: Arc::new(port_map),
             port_queues: Arc::new(DashMap::new()),
             worker_assignments: Arc::new(DashMap::new()),
             running: Arc::new(AtomicBool::new(true)),
@@ -262,28 +249,36 @@ impl PortBasedSender {
         }
     }
 
-    // Start worker threads with CPU affinity
+    // Start worker threads with cross-platform CPU affinity
     fn start_worker_threads(self: Arc<Self>) -> Vec<thread::JoinHandle<()>> {
         let mut handles = Vec::with_capacity(self.worker_count);
         
-        // Get available CPU cores
-        let core_ids = Arc::new(get_core_ids().unwrap_or_else(|| {
-            warn!("Failed to get core IDs, CPU affinity will not be set");
-            vec![]
-        }));
+        // Try to get available CPU cores (cross-platform approach)
+        let core_ids = match core_affinity::get_core_ids() {
+            Some(ids) => {
+                info!("Detected {} CPU cores for affinity", ids.len());
+                Some(Arc::new(ids))
+            },
+            None => {
+                info!("CPU affinity not supported on this platform, continuing without core pinning");
+                None
+            }
+        };
         
         for worker_id in 0..self.worker_count {
             let sender = self.clone();
-            let core_ids = Arc::clone(&core_ids);
+            let core_ids_clone = core_ids.clone();
             
             let handle = thread::spawn(move || {
-                // Set CPU affinity if possible
-                if !core_ids.is_empty() {
-                    let core = core_ids[worker_id % core_ids.len()];
-                    if set_for_current(core) {
-                        info!("Worker {} pinned to CPU core {}", worker_id, core.id);
-                    } else {
-                        warn!("Failed to set CPU affinity for worker {}", worker_id);
+                // Set CPU affinity if supported
+                if let Some(cores) = &core_ids_clone {
+                    if !cores.is_empty() {
+                        let core = cores[worker_id % cores.len()];
+                        if core_affinity::set_for_current(core) {
+                            debug!("Worker {} pinned to CPU core {}", worker_id, core.id);
+                        } else {
+                            debug!("Failed to set CPU affinity for worker {}", worker_id);
+                        }
                     }
                 }
                 
@@ -299,11 +294,6 @@ impl PortBasedSender {
                 if assigned_ports.is_empty() {
                     info!("Worker {} has no assigned ports, exiting", worker_id);
                     return;
-                }
-                
-                // Log which specific ports this worker is handling
-                for &port in &assigned_ports {
-                    info!("Worker {} processing port {}", worker_id, port);
                 }
                 
                 // Create per-port rate limiters to maintain ordering within each port
@@ -328,11 +318,8 @@ impl PortBasedSender {
                                     rate_limiter.acquire(packet.timestamp);
                                 }
                                 
-                                // Determine destination port (apply port mapping if any)
-                                let dest_port = sender.port_map.get(&packet.dest_port)
-                                    .copied()
-                                    .unwrap_or(packet.dest_port);
-                                
+                                // Send packet to original destination port (no mapping)
+                                let dest_port = packet.dest_port;
                                 let dest_addr = SocketAddr::new(sender.target_ip, dest_port);
                                 
                                 // Send packet (sequential order for each port is guaranteed)
@@ -357,7 +344,7 @@ impl PortBasedSender {
                     }
                 }
                 
-                info!("Worker {} shutting down", worker_id);
+                debug!("Worker {} shutting down", worker_id);
             });
             
             handles.push(handle);
@@ -371,7 +358,11 @@ impl PortBasedSender {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    fn get_stats(&self) -> (u64, u64, u64, usize) {
+    fn set_total_packets(&self, total: u64) {
+        self.stats.total_packets.store(total, Ordering::Relaxed);
+    }
+
+    fn get_stats(&self) -> (u64, u64, u64, usize, u64) {
         let queue_size: usize = self.port_queues
             .iter()
             .map(|entry| entry.len())
@@ -382,6 +373,7 @@ impl PortBasedSender {
             self.stats.sent_bytes.load(Ordering::Relaxed),
             self.stats.errors.load(Ordering::Relaxed),
             queue_size,
+            self.stats.total_packets.load(Ordering::Relaxed),
         )
     }
 
@@ -394,77 +386,50 @@ impl PortBasedSender {
     }
 }
 
-fn parse_port_mapping(port_map_str: &str) -> Result<HashMap<u16, u16>> {
-    let mut port_map = HashMap::new();
-    
-    for mapping in port_map_str.split(',') {
-        let parts: Vec<&str> = mapping.trim().split(':').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!("Invalid port mapping: '{}'", mapping));
-        }
-        
-        let old_port: u16 = parts[0].parse()?;
-        let new_port: u16 = parts[1].parse()?;
-        port_map.insert(old_port, new_port);
-    }
-    
-    Ok(port_map)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    
-    // Initialize logging
+    // Initialize logging with smart defaults
     tracing_subscriber::fmt()
-        .with_max_level(if args.verbose { 
-            tracing::Level::DEBUG 
-        } else { 
-            tracing::Level::INFO 
-        })
+        .with_max_level(tracing::Level::INFO)
         .init();
 
+    let args = Args::parse();
+    
     info!("Starting CBOE PCAP Replayer (High-Performance)");
-    info!("Target: {}", args.target);
-    info!("Multicast: {}", args.multicast);
-
+    info!("Target IP: {}", args.target);
+    info!("PCAP file: {}", args.file);
+    
     // Parse target IP
     let target_ip: IpAddr = args.target.parse()?;
     
-    // Parse port mapping
-    let port_map = if let Some(port_map_str) = &args.port_map {
-        info!("Port mapping: {}", port_map_str);
-        parse_port_mapping(port_map_str)?
-    } else {
-        HashMap::new()
-    };
-
-    // Analyze PCAP file first to get the ports
+    // Analyze PCAP file first to get the ports and packet count
     let reader = PcapReader::new(&args.file)?;
     let pcap_analysis = reader.discover_ports()?;
     
     // Extract ports from analysis
     let ports: HashSet<u16> = pcap_analysis.ports;
     let ports_vec: Vec<u16> = ports.iter().cloned().collect();
-    info!("Detected {} unique ports: {:?}", ports.len(), ports_vec);
     
-    // Determine number of worker threads based on detected ports
+    // Log PCAP file analysis summary
+    info!("PCAP analysis summary:");
+    info!("  Total packets: {}", pcap_analysis.total_packets);
+    info!("  UDP packets: {}", pcap_analysis.udp_packets);
+    info!("  Duration: {:.3} seconds", pcap_analysis.duration_seconds);
+    info!("  Original rate: {} packets/second", pcap_analysis.calculated_rate);
+    info!("  Detected {} unique ports: {:?}", ports.len(), ports_vec);
+    
+    // Determine optimal number of worker threads based on detected ports
     let cpu_count = num_cpus::get();
-    let worker_count = match args.threads {
-        Some(threads) => threads,
-        None => {
-            if ports.is_empty() {
-                info!("No ports detected in PCAP, defaulting to {} CPU cores", cpu_count);
-                cpu_count
-            } else {
-                let optimal_count = ports.len().min(cpu_count);
-                info!("Auto-configuring {} worker threads for {} detected ports", 
-                     optimal_count, ports.len());
-                optimal_count
-            }
-        }
+    let worker_count = if ports.is_empty() {
+        info!("No ports detected in PCAP, defaulting to {} CPU cores", cpu_count);
+        cpu_count
+    } else {
+        // Use one thread per port, up to the number of CPU cores
+        let optimal_count = ports.len().min(cpu_count);
+        info!("Auto-configuring {} worker threads for {} detected ports", 
+             optimal_count, ports.len());
+        optimal_count
     };
-    info!("Using {} worker threads", worker_count);
     
     // Show rate info
     let rate_info = match args.rate {
@@ -473,23 +438,15 @@ async fn main() -> Result<()> {
     };
     info!("Using rate: {}", rate_info);
 
-    // Show port mapping info
-    if !port_map.is_empty() {
-        info!("Port mapping configuration:");
-        for (old_port, new_port) in &port_map {
-            info!("  {} -> {}", old_port, new_port);
-        }
-    }
-
     // Create optimized sender with per-port queues
     let sender = Arc::new(PortBasedSender::new(
         target_ip,
-        port_map,
         args.rate,
-        args.multicast,
-        args.interface.as_deref(),
         worker_count,
     )?);
+
+    // Set total packet count for progress tracking
+    sender.set_total_packets(pcap_analysis.udp_packets);
 
     // Distribute ports to workers for optimal load balancing
     sender.distribute_ports(&ports);
@@ -504,18 +461,26 @@ async fn main() -> Result<()> {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             let mut last_packets = 0u64;
             let mut last_time = Instant::now();
+            let total_packets = sender.stats.total_packets.load(Ordering::Relaxed);
 
             loop {
                 interval.tick().await;
                 
-                let (packets, bytes, errors, queue_len) = sender.get_stats();
+                let (packets, bytes, errors, queue_len, _) = sender.get_stats();
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_time).as_secs_f64();
                 let pps = (packets - last_packets) as f64 / elapsed;
                 
+                // Calculate progress percentage
+                let progress = if total_packets > 0 {
+                    (packets as f64 / total_packets as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                
                 info!(
-                    "Stats: {} packets, {} bytes, {} errors, {} pps, total queue: {}",
-                    packets, bytes, errors, pps as u64, queue_len
+                    "Progress: {:.1}% ({}/{}) - Rate: {} pps - Sent: {} bytes - Errors: {} - Queue: {}",
+                    progress, packets, total_packets, pps as u64, bytes, errors, queue_len
                 );
                 
                 // Periodically show queue sizes for ports with significant backlogs
@@ -548,11 +513,15 @@ async fn main() -> Result<()> {
     });
 
     // Main packet reading and distribution loop
+    let start_time = Instant::now();
+    let mut replay_count = 0;
+    
     loop {
+        replay_count += 1;
         let mut reader = PcapReader::new(&args.file)?;
         let mut packet_count = 0;
 
-        info!("Starting optimized packet replay with per-port queues...");
+        info!("Starting replay #{} with per-port queues...", replay_count);
         
         while let Some(packet) = reader.next_packet()? {
             if !running.load(Ordering::Relaxed) {
@@ -564,7 +533,7 @@ async fn main() -> Result<()> {
             
             // Progress reporting
             if packet_count % 100000 == 0 {
-                info!("Queued {} packets", packet_count);
+                debug!("Queued {} packets", packet_count);
             }
             
             // Brief yield to prevent overwhelming the system
@@ -573,7 +542,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        info!("Queued {} packets total", packet_count);
+        info!("Queued {} packets in replay #{}", packet_count, replay_count);
 
         if !args.r#loop {
             break;
@@ -601,8 +570,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    let (packets, bytes, errors, _) = sender.get_stats();
-    info!("Final stats: {} packets, {} bytes, {} errors", packets, bytes, errors);
+    // Calculate and display final stats
+    let (packets, bytes, errors, _, total) = sender.get_stats();
+    let duration = start_time.elapsed();
+    let avg_rate = if duration.as_secs() > 0 {
+        packets / duration.as_secs()
+    } else {
+        packets
+    };
+    
+    // Print summary
+    info!("======= REPLAY SUMMARY =======");
+    info!("Total time: {:.2} seconds", duration.as_secs_f64());
+    info!("Packets processed: {}/{} ({:.2}%)", 
+          packets, total, 
+          if total > 0 { (packets as f64 / total as f64) * 100.0 } else { 0.0 });
+    info!("Bytes sent: {} ({:.2} MB)", 
+          bytes, bytes as f64 / (1024.0 * 1024.0));
+    info!("Errors: {}", errors);
+    info!("Average rate: {} packets/second", avg_rate);
+    info!("Replay count: {}", replay_count);
+    info!("==============================");
+    
     info!("CBOE PCAP replayer shutdown complete");
 
     Ok(())
