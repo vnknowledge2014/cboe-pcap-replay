@@ -51,7 +51,6 @@ enum RateLimiterMode {
 
 /// High-performance packet processor with per-port queues
 struct PortBasedSender {
-    socket: Arc<Socket>,
     target_ip: IpAddr,
     // Lock-free port queues - one queue per port
     port_queues: Arc<DashMap<u16, Arc<SegQueue<PacketData>>>>,
@@ -156,45 +155,12 @@ impl PortBasedSender {
         rate: Option<u64>,
         worker_count: usize,
     ) -> Result<Self> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        
-        // Optimize socket for performance
-        if let Err(e) = socket.set_send_buffer_size(8 * 1024 * 1024) {
-            warn!("Failed to set send buffer: {}", e);
-        }
-        
-        // Always configure for multicast
-        if target_ip.is_ipv4() {
-            if let IpAddr::V4(addr) = target_ip {
-                if addr.is_multicast() {
-                    socket.set_multicast_ttl_v4(64)?;
-                    
-                    // Try to find the best interface for multicast
-                    let interfaces = pnet::datalink::interfaces();
-                    let default_iface = interfaces.iter()
-                        .find(|iface| iface.is_up() && !iface.is_loopback() && !iface.ips.is_empty());
-                    
-                    if let Some(iface) = default_iface {
-                        if let Some(ipv4) = iface.ips.iter().find(|ip| ip.is_ipv4()) {
-                            if let IpAddr::V4(local_addr) = ipv4.ip() {
-                                socket.set_multicast_if_v4(&local_addr)?;
-                                info!("Using interface {} (IP: {}) for multicast", iface.name, local_addr);
-                            }
-                        }
-                    }
-                    
-                    info!("Configured for UDP multicast to {}", addr);
-                }
-            }
-        }
-        
         let mode = match rate {
             Some(rate) => RateLimiterMode::FixedRate(rate),
             None => RateLimiterMode::PcapTiming,
         };
         
         Ok(Self {
-            socket: Arc::new(socket),
             target_ip,
             port_queues: Arc::new(DashMap::new()),
             worker_assignments: Arc::new(DashMap::new()),
@@ -298,8 +264,28 @@ impl PortBasedSender {
                 
                 // Create per-port rate limiters to maintain ordering within each port
                 let mut port_rate_limiters: HashMap<u16, PortRateLimiter> = HashMap::new();
+                
+                // Create per-port sockets for better performance
+                let mut port_sockets: HashMap<u16, Socket> = HashMap::new();
+                
+                // Initialize sockets and rate limiters for each port
                 for &port in &assigned_ports {
                     port_rate_limiters.insert(port, PortRateLimiter::new(sender.mode.clone()));
+                    
+                    // Create UDP socket for this port
+                    match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+                        Ok(socket) => {
+                            // Set buffer size
+                            if let Err(e) = socket.set_send_buffer_size(1024 * 1024) {
+                                warn!("Failed to set send buffer for port {}: {}", port, e);
+                            }
+                            port_sockets.insert(port, socket);
+                        },
+                        Err(e) => {
+                            sender.stats.errors.fetch_add(1, Ordering::Relaxed);
+                            warn!("Failed to create socket for port {}: {}", port, e);
+                        }
+                    }
                 }
                 
                 // Process packets from all assigned ports
@@ -318,21 +304,24 @@ impl PortBasedSender {
                                     rate_limiter.acquire(packet.timestamp);
                                 }
                                 
-                                // Send packet to original destination port (no mapping)
-                                let dest_port = packet.dest_port;
-                                let dest_addr = SocketAddr::new(sender.target_ip, dest_port);
-                                
-                                // Send packet (sequential order for each port is guaranteed)
-                                match sender.socket.send_to(&packet.payload, &dest_addr.into()) {
-                                    Ok(bytes_sent) => {
-                                        sender.stats.sent_packets.fetch_add(1, Ordering::Relaxed);
-                                        sender.stats.sent_bytes.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+                                // Get socket for this port
+                                if let Some(socket) = port_sockets.get(&port) {
+                                    // Send packet
+                                    let dest_addr = SocketAddr::new(sender.target_ip, packet.dest_port);
+                                    match socket.send_to(&packet.payload, &dest_addr.into()) {
+                                        Ok(bytes_sent) => {
+                                            sender.stats.sent_packets.fetch_add(1, Ordering::Relaxed);
+                                            sender.stats.sent_bytes.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            sender.stats.errors.fetch_add(1, Ordering::Relaxed);
+                                            warn!("Worker {} failed to send to {}:{} - {}", 
+                                                 worker_id, sender.target_ip, packet.dest_port, e);
+                                        }
                                     }
-                                    Err(e) => {
-                                        sender.stats.errors.fetch_add(1, Ordering::Relaxed);
-                                        warn!("Worker {} failed to send to {}:{} - {}", 
-                                            worker_id, sender.target_ip, dest_port, e);
-                                    }
+                                } else {
+                                    sender.stats.errors.fetch_add(1, Ordering::Relaxed);
+                                    warn!("No socket found for port {}", port);
                                 }
                             }
                         }
@@ -395,7 +384,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     
-    info!("Starting CBOE PCAP Replayer (High-Performance)");
+    info!("Starting CBOE PCAP Replayer (High-Performance with Standard UDP Sockets)");
     info!("Target IP: {}", args.target);
     info!("PCAP file: {}", args.file);
     

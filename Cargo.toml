@@ -19,6 +19,8 @@ crossbeam-utils = "0.8"
 num_cpus = "1.15"
 core_affinity = "0.8"
 dashmap = "5.4"
+rand = "0.8"
+nix = { version = "0.27", features = ["user"] }
 
 [profile.release]
 lto = true
