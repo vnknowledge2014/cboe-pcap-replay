@@ -1,0 +1,22 @@
+# Build directories
+/cboe-pcap-receiver/target
+/cboe-pcap-replay/target
+target/
+
+# Generated data files - prevent large files
+*.csv
+*.pcap
+market_data_*.*
+test_*.*
+
+# System files
+.DS_Store
+
+# Log files
+*.log
+/cboe-pcap-receiver/target/log.txt
+
+# Large data files (prevent accidental commits > 50MB)
+**/market_data_*
+**/test_data_*
+EOF < /dev/null
