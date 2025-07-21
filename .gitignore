@@ -4,3 +4,5 @@
 *.pcap
 
 .DS_Store
+
+/cboe-pcap-receiver/target/log.txt
