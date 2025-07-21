@@ -1,4 +1,66 @@
-# CBOE PCAP Replayer
+# CBOE PCAP Suite
+
+Complete suite of tools for CBOE PITCH market data simulation, generation, and replay - now integrated into a single powerful tool with automated workflow support.
+
+## Tools Overview
+
+### Integrated CBOE PCAP Replayer (`cboe-pcap-replay`)
+**All-in-one tool** with three powerful modes:
+- **Generate**: Creates realistic CBOE PITCH market data in CSV format
+- **Convert**: Converts CSV data to PCAP format with proper encoding
+- **Replay**: High-performance sequential packet replayer with ordering guarantee
+
+### CBOE PCAP Receiver (`cboe-pcap-receiver`)
+Real-time receiver for monitoring and validating replayed packets with comprehensive analysis.
+
+### Automated Workflow (`cboe_market_data_workflow.sh`)
+Complete automation script that runs the entire pipeline from data generation to replay analysis.
+
+## Quick Start
+
+### Using the Integrated Tool
+
+```bash
+# Build the integrated tool
+cd cboe-pcap-replay
+cargo build --release
+
+# 1. Generate realistic CSV market data
+./target/release/cboe-pcap-replay generate \
+  --symbols AAPL,MSFT,GOOGL,TSLA \
+  --duration 300 \
+  --output market_data.csv
+
+# 2. Convert CSV to PCAP format
+./target/release/cboe-pcap-replay convert \
+  --input market_data.csv \
+  --output market_data.pcap
+
+# 3. Replay PCAP data
+./target/release/cboe-pcap-replay replay \
+  --file market_data.pcap \
+  --target 127.0.0.1
+```
+
+### Using the Automated Workflow
+
+```bash
+# Build all tools
+cd cboe-pcap-replay && cargo build --release && cd ..
+cd cboe-pcap-receiver && cargo build --release && cd ..
+
+# Run complete automated workflow
+./cboe_market_data_workflow.sh
+```
+
+The automation script will:
+1. Generate 60 seconds of realistic market data
+2. Convert it to PCAP format
+3. Start the receiver in background
+4. Replay the data and analyze results
+5. Provide comprehensive summary
+
+## CBOE PCAP Replayer
 
 Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ file PCAP của CBOE, đảm bảo thứ tự tuần tự chính xác trên mỗi port và độ tin cậy cao trong việc truyền nhận gói tin.
 
@@ -33,110 +95,198 @@ Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ 
 - **Phân tích hiệu suất**: Thống kê về số lượng gói bị mất, thứ tự sai, trùng lặp
 - **Đo độ trễ**: Tính toán khoảng cách thời gian giữa các gói tin
 
-## Cài đặt
+## Installation
 
-### Yêu cầu
+### Requirements
 
 - Rust 2024 Edition
-- libpcap-dev (hoặc tương đương trên hệ điều hành của bạn)
+- libpcap-dev (or equivalent on your OS)
 
 ```bash
-# Cài đặt libpcap
+# Install libpcap
 sudo apt-get install libpcap-dev    # Ubuntu/Debian
 sudo yum install libpcap-devel      # CentOS/RHEL
 brew install libpcap                # macOS
 
 # Clone repository
-git clone https://github.com/your-username/cboe-pcap-replay.git
-cd cboe-pcap-replay
+git clone https://github.com/your-username/cboe-pcap-suite.git
+cd cboe-pcap-suite
 
-# Biên dịch
-cargo build --release
+# Build all tools
+for dir in cboe-pcap-replay cboe-pcap-receiver; do
+    cd $dir && cargo build --release && cd ..
+done
 ```
 
-Sản phẩm biên dịch sẽ nằm trong thư mục `target/release/cboe-pcap-replay` và `target/release/cboe-pcap-receiver`.
+Compiled binaries will be available in each tool's `target/release/` directory.
 
-### Sử dụng với Cargo
+## Tool Documentation
 
-Nếu bạn đang phát triển hoặc muốn chạy trực tiếp từ mã nguồn:
+- [CBOE PCAP Replayer](cboe-pcap-replay/README.md) - Complete integrated tool (generate, convert, replay)
+- [CBOE PCAP Receiver](cboe-pcap-receiver/README.md) - Monitor packet reception
+
+## CBOE PITCH Message Support
+
+All tools support the following CBOE PITCH message types:
+
+- **Trading Status (0x31)**: Market open/close states
+- **Add Order (0x37)**: New orders on book
+- **Order Executed (0x38)**: Order fills  
+- **Trade (0x3D)**: Off-exchange trades
+- **Delete Order (0x3C)**: Order cancellations
+
+## Workflow Examples
+
+### Generate and Test Market Data
 
 ```bash
-# Chạy sender trong chế độ release (hiệu năng cao hơn)
-cargo run --release --bin cboe-pcap-replay -- -f market_data.pcap -t 127.0.0.1
+# Generate 1 hour of AAPL,MSFT data
+cboe-pcap-replay generate --symbols AAPL,MSFT --duration 3600 --output market.csv
 
-# Chạy receiver để kiểm tra packet reception
-cargo run --release --bin cboe-pcap-receiver -- -p 30501,30502 -i lo0
+# Convert to PCAP
+cboe-pcap-replay convert --input market.csv --output market.pcap
+
+# Test replay
+cboe-pcap-replay replay --file market.pcap --target 127.0.0.1 --rate 1000
 ```
 
-### Sử dụng Sender (Replayer)
+### High Performance Simulation
 
+```bash  
+# Generate large dataset
+cboe-pcap-replay generate --symbols AAPL,MSFT,GOOGL,TSLA,AMZN --duration 28800 --output full_day.csv
+
+# Convert with custom network settings
+cboe-pcap-replay convert --input full_day.csv --output full_day.pcap --dest-ip 239.1.1.1
+
+# Replay at full speed
+cboe-pcap-replay replay --file full_day.pcap --target 239.1.1.1 --loop
 ```
-cboe-pcap-replay [OPTIONS] --file <FILE> --target <TARGET>
-```
 
-#### Tham số bắt buộc
+## Integrated Tool Usage
 
-- `-f, --file <FILE>`: Đường dẫn tới file PCAP
-- `-t, --target <TARGET>`: Địa chỉ IP đích (hỗ trợ multicast tự động)
-
-#### Tham số tùy chọn
-
-- `-r, --rate <RATE>`: Tốc độ giới hạn theo số packet mỗi giây (không chỉ định: phát lại theo đúng timing trong PCAP gốc)
-- `--loop`: Lặp lại liên tục
-
-#### Ví dụ
-
-##### Phát lại với timing gốc:
+### Generate Command
+Create realistic CBOE PITCH market data in CSV format:
 
 ```bash
-sudo ./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100
+cboe-pcap-replay generate [OPTIONS]
 ```
 
-##### Phát lại với tốc độ cố định:
+**Options:**
+- `-s, --symbols <SYMBOLS>`: Comma-separated symbols (default: AAPL,MSFT,GOOGL,TSLA,AMZN,META,NVDA,NFLX)
+- `-d, --duration <DURATION>`: Duration in seconds (default: 3600)
+- `-o, --output <OUTPUT>`: Output CSV file (default: market_data.csv)
+- `-p, --port <PORT>`: Base port number (default: 30501)
+- `-u, --units <UNITS>`: Number of units/ports (default: 4)
+
+**Example:**
+```bash
+./cboe-pcap-replay generate --symbols AAPL,MSFT --duration 300 --output my_data.csv
+```
+
+### Convert Command
+Convert CSV market data to PCAP format:
 
 ```bash
-sudo ./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 -r 10000
+cboe-pcap-replay convert [OPTIONS] --input <INPUT> --output <OUTPUT>
 ```
 
-##### Phát lại đến địa chỉ multicast:
+**Required Options:**
+- `-i, --input <INPUT>`: Input CSV file path
+- `-o, --output <OUTPUT>`: Output PCAP file path
+
+**Optional:**
+- `--src-ip <IP>`: Source IP address (default: 192.168.1.1)
+- `--dest-ip <IP>`: Destination IP address (default: 192.168.1.100)
+- `--src-port <PORT>`: Source port (default: 12345)
+
+**Example:**
+```bash
+./cboe-pcap-replay convert --input my_data.csv --output my_data.pcap
+```
+
+### Replay Command  
+Replay PCAP data with high performance:
 
 ```bash
-sudo ./cboe-pcap-replay -f market_data.pcap -t 239.1.1.1
+cboe-pcap-replay replay [OPTIONS] --file <FILE> --target <TARGET>
 ```
 
-##### Lặp lại liên tục:
+**Required Options:**
+- `-f, --file <FILE>`: Path to PCAP file
+- `-t, --target <TARGET>`: Target IP address
+
+**Optional:**
+- `-r, --rate <RATE>`: Rate limit in packets/second (default: original PCAP timing)
+- `--loop`: Loop replay indefinitely
+
+**Examples:**
 
 ```bash
-sudo ./cboe-pcap-replay -f market_data.pcap -t 192.168.1.100 --loop
+# Replay with original timing
+./cboe-pcap-replay replay --file market_data.pcap --target 127.0.0.1
+
+# Replay with fixed rate
+./cboe-pcap-replay replay --file market_data.pcap --target 127.0.0.1 --rate 10000
+
+# Loop replay to multicast
+./cboe-pcap-replay replay --file market_data.pcap --target 239.1.1.1 --loop
 ```
 
-### Sử dụng Receiver
+### Development Usage
 
-```
-cboe-pcap-receiver [OPTIONS] --ports <PORTS> --interface <INTERFACE>
-```
-
-#### Tham số bắt buộc
-
-- `-p, --ports <PORTS>`: Danh sách các port cần theo dõi (phân cách bằng dấu phẩy)
-- `-i, --interface <INTERFACE>`: Interface mạng cần theo dõi (ví dụ: lo0, eth0)
-
-#### Tham số tùy chọn
-
-- `-t, --time <TIME>`: Thời gian chạy tính bằng giây (0 = vô hạn)
-- `-i, --interval <INTERVAL>`: Khoảng thời gian báo cáo tính bằng giây
-
-#### Ví dụ
+If running from source:
 
 ```bash
-sudo ./cboe-pcap-receiver -p 30501,30502 -i lo0
+# Generate data
+cargo run --release -- generate --symbols AAPL,MSFT --duration 300
+
+# Convert to PCAP  
+cargo run --release -- convert --input market_data.csv --output market_data.pcap
+
+# Replay data
+cargo run --release -- replay --file market_data.pcap --target 127.0.0.1
 ```
 
-## Yêu cầu quyền root
+### CBOE Receiver Usage
 
-Cả hai công cụ đều yêu cầu quyền root (sudo) để hoạt động đúng:
-- **Sender (Replayer)**: Cần quyền root để sử dụng raw socket
-- **Receiver**: Cần quyền root để truy cập BPF device
+```
+cboe-pcap-receiver [OPTIONS] --ports <PORTS>
+```
+
+#### Required Parameters
+
+- `-p, --ports <PORTS>`: Comma-separated list of ports to monitor
+
+#### Optional Parameters
+
+- `-i, --interface <INTERFACE>`: IP address to bind to [default: 127.0.0.1]
+- `-t, --time <TIME>`: Runtime in seconds (0 = infinite) [default: 0]
+- `-r, --interval <INTERVAL>`: Report interval in seconds [default: 5]
+- `-v, --verbose`: Enable verbose logging
+
+#### Examples
+
+```bash
+# Listen on loopback interface
+./cboe-pcap-receiver -p 30501,30502 -i 127.0.0.1
+
+# Listen on all interfaces
+./cboe-pcap-receiver -p 30501,30502 -i 0.0.0.0
+
+# Listen with specific IP and custom interval
+./cboe-pcap-receiver -p 30501,30502 -i 192.168.1.100 -r 10
+
+# Verbose mode with time limit
+./cboe-pcap-receiver -p 30501,30502 -v -t 60
+```
+
+## Permissions
+
+- **Replayer**: No special permissions required - uses standard UDP sockets
+- **Receiver**: No special permissions required - uses standard UDP sockets
+
+Both tools have been redesigned to work without root privileges for easier deployment and testing.
 
 ## Quy trình hoạt động
 
@@ -153,11 +303,11 @@ Cả hai công cụ đều yêu cầu quyền root (sudo) để hoạt động �
 
 ### Receiver
 
-1. **Mở BPF device**: Thiết lập Berkeley Packet Filter để bắt gói tin ở tầng thấp.
-2. **Lọc gói tin**: Thiết lập bộ lọc BPF để chỉ bắt các gói UDP đến các port cụ thể.
-3. **Phân tích gói tin**: Trích xuất thông tin từ header và payload của gói tin.
-4. **Kiểm tra sequence**: Phát hiện gói bị mất, trùng lặp hoặc thứ tự sai.
-5. **Báo cáo định kỳ**: Hiển thị thống kê về các gói đã nhận, tỉ lệ mất gói, và hiệu suất.
+1. **UDP Socket Binding**: Creates standard UDP sockets on specified ports and IP addresses
+2. **Packet Reception**: Receives UDP packets using standard socket operations
+3. **CBOE PITCH Parsing**: Extracts and validates CBOE PITCH message headers and payloads
+4. **Sequence Analysis**: Detects missing, duplicate, or out-of-order packets by sequence number
+5. **Real-time Statistics**: Displays comprehensive reception statistics and performance metrics
 
 ## Theo dõi hiệu suất
 

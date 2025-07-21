@@ -1,28 +1,22 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use std::thread;
 use tracing::{error, info, warn, debug};
-use std::ffi::CString;
-use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
 
 #[derive(Parser, Debug)]
 #[command(name = "cboe-pcap-receiver")]
-#[command(about = "BPF-based UDP receiver to verify CBOE packet reception with sequence checking")]
+#[command(about = "UDP receiver to monitor CBOE packet reception with sequence checking")]
 struct Args {
     /// Ports to listen on (comma-separated)
     #[arg(short, long)]
     ports: String,
 
-    /// Interface to listen on
-    #[arg(short = 'i', long, default_value = "lo0")]
+    /// Interface IP to bind to
+    #[arg(short = 'i', long, default_value = "127.0.0.1")]
     interface: String,
 
     /// Time to run in seconds (0 = infinite)
@@ -30,7 +24,7 @@ struct Args {
     time: u64,
 
     /// Report interval in seconds
-    #[arg(short = 't', long, default_value = "1")]
+    #[arg(short = 'r', long, default_value = "5")]
     interval: u64,
 
     /// Verbose logging
@@ -47,15 +41,73 @@ struct PortStats {
     last_report_packets: u64,
     last_report_bytes: u64,
     max_gap_ms: u64,
+    sequences_seen: HashMap<u8, SequenceTracker>,
+    first_packet_time: Option<Instant>,
+    last_packet_time: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct SequenceTracker {
+    unit: u8,
+    last_sequence: Option<u32>,
+    expected_next: Option<u32>,
+    gaps: u64,
+    duplicates: u64,
+    out_of_order: u64,
+    total_messages: u64,
     min_sequence: Option<u32>,
     max_sequence: Option<u32>,
-    last_packet_time: Option<Instant>,
-    // Store all detected sequence numbers 
-    sequence_numbers: HashMap<u32, bool>,
-    last_sequence: Option<u32>,
-    missing_sequences: u64,
-    out_of_order_sequences: u64,
-    duplicate_sequences: u64,
+}
+
+impl SequenceTracker {
+    fn new(unit: u8) -> Self {
+        Self {
+            unit,
+            last_sequence: None,
+            expected_next: None,
+            gaps: 0,
+            duplicates: 0,
+            out_of_order: 0,
+            total_messages: 0,
+            min_sequence: None,
+            max_sequence: None,
+        }
+    }
+
+    fn process_sequence(&mut self, sequence: u32) {
+        self.total_messages += 1;
+
+        // Track min/max
+        if self.min_sequence.is_none() || sequence < self.min_sequence.unwrap() {
+            self.min_sequence = Some(sequence);
+        }
+        if self.max_sequence.is_none() || sequence > self.max_sequence.unwrap() {
+            self.max_sequence = Some(sequence);
+        }
+
+        if let Some(last) = self.last_sequence {
+            if sequence == last {
+                self.duplicates += 1;
+                debug!("Unit {} duplicate sequence: {}", self.unit, sequence);
+            } else if sequence < last {
+                self.out_of_order += 1;
+                debug!("Unit {} out of order: {} (last: {})", self.unit, sequence, last);
+            } else if sequence != last + 1 {
+                let gap = sequence - last - 1;
+                self.gaps += gap as u64;
+                debug!("Unit {} sequence gap: {} messages between {} and {}", 
+                       self.unit, gap, last, sequence);
+            }
+        }
+
+        self.last_sequence = Some(sequence);
+        self.expected_next = Some(sequence + 1);
+    }
+
+    fn get_stats(&self) -> (u64, u64, u64, u64, Option<u32>, Option<u32>) {
+        (self.total_messages, self.gaps, self.duplicates, self.out_of_order, 
+         self.min_sequence, self.max_sequence)
+    }
 }
 
 impl PortStats {
@@ -68,637 +120,280 @@ impl PortStats {
             last_report_packets: 0,
             last_report_bytes: 0,
             max_gap_ms: 0,
-            min_sequence: None,
-            max_sequence: None,
+            sequences_seen: HashMap::new(),
+            first_packet_time: None,
             last_packet_time: None,
-            sequence_numbers: HashMap::new(),
-            last_sequence: None,
-            missing_sequences: 0,
-            out_of_order_sequences: 0,
-            duplicate_sequences: 0,
         }
     }
 
-    fn record_packet(&mut self, size: usize, data: &[u8]) {
-        self.packets_received += 1;
-        self.bytes_received += size as u64;
-
+    fn update(&mut self, bytes: usize, sequence_unit: Option<u8>, sequence_number: Option<u32>) {
         let now = Instant::now();
-
-        // Track packet timing
+        
+        if self.first_packet_time.is_none() {
+            self.first_packet_time = Some(now);
+        }
+        
         if let Some(last_time) = self.last_packet_time {
-            let gap = now.duration_since(last_time).as_millis() as u64;
-            if gap > self.max_gap_ms {
-                self.max_gap_ms = gap;
+            let gap_ms = now.duration_since(last_time).as_millis() as u64;
+            if gap_ms > self.max_gap_ms {
+                self.max_gap_ms = gap_ms;
             }
         }
+        
         self.last_packet_time = Some(now);
+        self.packets_received += 1;
+        self.bytes_received += bytes as u64;
 
-        // Check for sequence number (first 4 bytes are sequence)
-        if data.len() >= 4 {
-            let seq = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-            
-            // Update min/max sequence seen
-            if let Some(min_seq) = self.min_sequence {
-                self.min_sequence = Some(min_seq.min(seq));
-            } else {
-                self.min_sequence = Some(seq);
-            }
-            
-            if let Some(max_seq) = self.max_sequence {
-                self.max_sequence = Some(max_seq.max(seq));
-            } else {
-                self.max_sequence = Some(seq);
-            }
-
-            // Check for duplicates
-            if self.sequence_numbers.contains_key(&seq) {
-                self.duplicate_sequences += 1;
-                debug!("Port {}: Duplicate sequence {} detected", self.port, seq);
-            }
-            
-            // Record the sequence
-            self.sequence_numbers.insert(seq, true);
-
-            // Check for missing or out-of-order sequences
-            if let Some(last_seq) = self.last_sequence {
-                if seq < last_seq {
-                    // Out of order sequence
-                    self.out_of_order_sequences += 1;
-                    debug!("Port {}: Out-of-order sequence {} received after {}", 
-                          self.port, seq, last_seq);
-                } else if seq > last_seq + 1 {
-                    // Missing sequences detected
-                    let missing = seq - last_seq - 1;
-                    let missing_u64: u64 = u64::from(missing);
-                    self.missing_sequences += missing_u64;
-                    debug!("Port {}: Missing {} sequence(s) between {} and {}", 
-                          self.port, missing, last_seq, seq);
-                }
-            }
-            self.last_sequence = Some(seq);
+        // Process sequence information if available
+        if let (Some(unit), Some(sequence)) = (sequence_unit, sequence_number) {
+            let tracker = self.sequences_seen.entry(unit).or_insert_with(|| SequenceTracker::new(unit));
+            tracker.process_sequence(sequence);
         }
     }
 
-    fn get_report(&mut self) -> String {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_report_time).as_secs_f64();
+    fn get_rate(&self) -> (f64, f64) {
+        let duration = self.last_report_time.elapsed().as_secs_f64();
+        if duration == 0.0 {
+            return (0.0, 0.0);
+        }
+
+        let packet_delta = self.packets_received - self.last_report_packets;
+        let byte_delta = self.bytes_received - self.last_report_bytes;
         
-        let packet_rate = (self.packets_received - self.last_report_packets) as f64 / elapsed;
-        let bytes_rate = (self.bytes_received - self.last_report_bytes) as f64 / elapsed;
-        
-        // Calculate sequence statistics
-        let total_expected = if let (Some(min), Some(max)) = (self.min_sequence, self.max_sequence) {
-            if max >= min {
-                (max - min + 1) as u64
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        
-        let total_received = self.sequence_numbers.len() as u64;
-        let completeness = if total_expected > 0 {
-            (total_received as f64 / total_expected as f64) * 100.0
-        } else {
-            0.0
-        };
-        
-        let report = format!(
-            "Port {:5}: {:8} packets ({:6.0} pps), {:10} bytes ({:6.2} MB/s), max gap: {} ms\n  \
-             Sequence range: {:?}-{:?}, completeness: {:.2}%, missing: {}, out-of-order: {}, duplicates: {}",
-            self.port,
-            self.packets_received,
-            packet_rate,
-            self.bytes_received,
-            bytes_rate / 1_048_576.0,
-            self.max_gap_ms,
-            self.min_sequence.unwrap_or(0),
-            self.max_sequence.unwrap_or(0),
-            completeness,
-            self.missing_sequences,
-            self.out_of_order_sequences,
-            self.duplicate_sequences
-        );
-        
-        self.last_report_time = now;
+        (packet_delta as f64 / duration, byte_delta as f64 / duration)
+    }
+
+    fn reset_rate_counters(&mut self) {
+        self.last_report_time = Instant::now();
         self.last_report_packets = self.packets_received;
         self.last_report_bytes = self.bytes_received;
-        
-        report
     }
 }
 
-// BPF constants
-const BIOCSETIF: libc::c_ulong = 0x8020426c;
-const BIOCGBLEN: libc::c_ulong = 0x40044266;
-const BIOCSETBLEN: libc::c_ulong = 0xc0044266;
-const BIOCIMMEDIATE: libc::c_ulong = 0x80044270;
-const BIOCSDLT: libc::c_ulong = 0x80044278;
-const BIOCPROMISC: libc::c_ulong = 0x20004269;
-const BIOCSETF: libc::c_ulong = 0x80084267;
-
-// BPF instruction
-#[repr(C)]
-struct BpfInsn {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
-}
-
-// BPF program
-#[repr(C)]
-struct BpfProgram {
-    bf_len: u32,
-    bf_insns: *const BpfInsn,
-}
-
-// BPF header
-#[repr(C)]
-struct BpfHdr {
-    bh_tstamp: libc::timeval,
-    bh_caplen: u32,
-    bh_datalen: u32,
-    bh_hdrlen: u16,
-}
-
-// BPF device wrapper
-struct BpfDevice {
-    fd: i32,
-    buffer: Vec<u8>,
-    buffer_len: usize,
-}
-
-impl BpfDevice {
-    fn open(interface: &str, buffer_size: usize, ports: &[u16]) -> Result<Self> {
-        // Find available BPF device
-        let mut fd = -1;
-        for i in 0..99 {
-            let dev_name = format!("/dev/bpf{}", i);
-            fd = unsafe { libc::open(CString::new(dev_name.clone())?.as_ptr(), libc::O_RDWR) };
-            if fd >= 0 {
-                info!("Opened BPF device: {}", dev_name);
-                break;
-            }
-        }
-        
-        if fd < 0 {
-            return Err(anyhow::anyhow!("Failed to open BPF device"));
-        }
-        
-        // Set buffer length
-        let mut buf_len: u32 = buffer_size as u32;
-        if unsafe { libc::ioctl(fd, BIOCSETBLEN, &mut buf_len) } < 0 {
-            unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("Failed to set BPF buffer length"));
-        }
-        
-        // Get actual buffer length
-        let mut actual_len: u32 = 0;
-        if unsafe { libc::ioctl(fd, BIOCGBLEN, &mut actual_len) } < 0 {
-            unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("Failed to get BPF buffer length"));
-        }
-        
-        info!("BPF buffer size: {} bytes", actual_len);
-        
-        // Bind to interface
-        let ifreq = unsafe {
-            let mut req: libc::ifreq = std::mem::zeroed();
-            let if_name = CString::new(interface)?;
-            let if_name_bytes = if_name.as_bytes_with_nul();
-            
-            if if_name_bytes.len() > req.ifr_name.len() {
-                return Err(anyhow::anyhow!("Interface name too long"));
-            }
-            
-            std::ptr::copy_nonoverlapping(
-                if_name_bytes.as_ptr(),
-                req.ifr_name.as_mut_ptr() as *mut u8,
-                if_name_bytes.len()
-            );
-            
-            req
-        };
-        
-        if unsafe { libc::ioctl(fd, BIOCSETIF, &ifreq) } < 0 {
-            unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("Failed to bind BPF to interface: {}", interface));
-        }
-        
-        // Enable immediate mode (don't wait for buffer to fill)
-        let immediate: u32 = 1;
-        if unsafe { libc::ioctl(fd, BIOCIMMEDIATE, &immediate) } < 0 {
-            unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("Failed to set immediate mode"));
-        }
-        
-        // Create BPF filter program to capture only UDP packets for specific ports
-        let filter = build_bpf_filter(ports)?;
-        
-        // Apply the filter
-        if unsafe { libc::ioctl(fd, BIOCSETF, &filter) } < 0 {
-            unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("Failed to set BPF filter"));
-        }
-        
-        info!("BPF filter set to capture UDP packets for ports: {:?}", ports);
-        
-        Ok(Self {
-            fd,
-            buffer: vec![0u8; actual_len as usize],
-            buffer_len: actual_len as usize,
-        })
+// Parse CBOE PITCH Sequenced Unit Header
+fn parse_sequenced_unit_header(data: &[u8]) -> Option<(u16, u8, u8, u32)> {
+    if data.len() < 8 {
+        return None;
     }
+
+    let length = u16::from_le_bytes([data[0], data[1]]);
+    let count = data[2];
+    let unit = data[3];
+    let sequence = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+    Some((length, count, unit, sequence))
+}
+
+// Parse CBOE PITCH message type from payload
+fn parse_message_type(data: &[u8]) -> Option<u8> {
+    if data.len() < 10 { // 8 bytes header + 2 bytes message minimum
+        return None;
+    }
+
+    // Skip sequenced unit header (8 bytes) and message length (1 byte)
+    Some(data[9]) // Message type is at offset 9
+}
+
+fn setup_udp_listener(port: u16, bind_ip: &str) -> Result<UdpSocket> {
+    let addr = format!("{}:{}", bind_ip, port);
+    let socket = UdpSocket::bind(&addr)?;
     
-    fn read_packet(&mut self) -> Result<Option<(Vec<u8>, u16)>> {
-        // Read from BPF device
-        let n = unsafe {
-            libc::read(self.fd, self.buffer.as_mut_ptr() as *mut libc::c_void, self.buffer_len)
-        };
-        
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(None);
+    // Set socket options for better performance
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    
+    // Try to increase receive buffer size using socket2
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        let fd = socket.as_raw_fd();
+        let buf_size = 1024 * 1024i32;
+        if libc::setsockopt(
+            fd, 
+            libc::SOL_SOCKET, 
+            libc::SO_RCVBUF, 
+            &buf_size as *const _ as *const libc::c_void, 
+            std::mem::size_of::<i32>() as libc::socklen_t
+        ) < 0 {
+            warn!("Failed to set large receive buffer for port {}", port);
+        }
+    }
+
+    info!("Listening on UDP {}:{}", bind_ip, port);
+    Ok(socket)
+}
+
+fn listen_on_port(port: u16, bind_ip: String, stats: Arc<Mutex<HashMap<u16, PortStats>>>) -> Result<()> {
+    let socket = setup_udp_listener(port, &bind_ip)?;
+    let mut buffer = vec![0u8; 65536]; // Max UDP packet size
+
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((size, src)) => {
+                debug!("Received {} bytes from {} on port {}", size, src, port);
+                
+                // Parse CBOE PITCH header if present
+                let (unit, sequence) = if let Some((_, _, unit, sequence)) = parse_sequenced_unit_header(&buffer[..size]) {
+                    (Some(unit), Some(sequence))
+                } else {
+                    (None, None)
+                };
+
+                // Log message type for verbose mode
+                if let Some(msg_type) = parse_message_type(&buffer[..size]) {
+                    debug!("Port {} received message type 0x{:02X} (unit: {:?}, seq: {:?})", 
+                           port, msg_type, unit, sequence);
+                }
+
+                // Update statistics
+                if let Ok(mut stats_map) = stats.lock() {
+                    let port_stats = stats_map.entry(port).or_insert_with(|| PortStats::new(port));
+                    port_stats.update(size, unit, sequence);
+                }
             }
-            return Err(anyhow::anyhow!("Failed to read from BPF: {}", err));
-        }
-        
-        if n == 0 {
-            return Ok(None);
-        }
-        
-        // Process the packet
-        let mut offset = 0;
-        while offset < n as usize {
-            let hdr = unsafe {
-                &*(self.buffer.as_ptr().add(offset) as *const BpfHdr)
-            };
-            
-            let packet_start = offset + hdr.bh_hdrlen as usize;
-            let packet_data = &self.buffer[packet_start..packet_start + hdr.bh_caplen as usize];
-            
-            // Parse Ethernet header
-            if let Some(eth) = EthernetPacket::new(packet_data) {
-                if eth.get_ethertype() == EtherTypes::Ipv4 {
-                    // Parse IPv4 header
-                    if let Some(ipv4) = Ipv4Packet::new(eth.payload()) {
-                        if ipv4.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
-                            // Parse UDP header
-                            if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                                let dest_port = udp.get_destination();
-                                let payload = udp.payload().to_vec();
-                                
-                                return Ok(Some((payload, dest_port)));
-                            }
-                        }
+            Err(e) => {
+                match e.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        // Normal timeout, continue listening
+                        continue;
+                    }
+                    _ => {
+                        error!("Error receiving on port {}: {}", port, e);
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
-            
-            // Move to next packet in buffer
-            offset += BPF_WORDALIGN(hdr.bh_hdrlen as usize + hdr.bh_caplen as usize);
         }
+    }
+}
+
+fn print_statistics(stats: &Arc<Mutex<HashMap<u16, PortStats>>>) {
+    if let Ok(mut stats_map) = stats.lock() {
+        println!("\n=== CBOE Packet Reception Statistics ===");
+        println!("{:<8} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8}", 
+                "Port", "Packets", "Bytes", "Pkt/sec", "MB/sec", "Max Gap(ms)", "Units");
+        println!("{}", "─".repeat(90));
+
+        let mut total_packets = 0u64;
+        let mut total_bytes = 0u64;
+
+        for (port, port_stats) in stats_map.iter_mut() {
+            let (pkt_rate, byte_rate) = port_stats.get_rate();
+            let mb_rate = byte_rate / (1024.0 * 1024.0);
+            
+            println!("{:<8} {:<12} {:<12} {:<15.1} {:<15.3} {:<12} {:<8}",
+                    port,
+                    port_stats.packets_received,
+                    port_stats.bytes_received,
+                    pkt_rate,
+                    mb_rate,
+                    port_stats.max_gap_ms,
+                    port_stats.sequences_seen.len());
+
+            total_packets += port_stats.packets_received;
+            total_bytes += port_stats.bytes_received;
+            
+            // Print sequence analysis for each unit on this port
+            for (unit, tracker) in &port_stats.sequences_seen {
+                let (total, gaps, dups, ooo, min_seq, max_seq) = tracker.get_stats();
+                println!("  └─ Unit {}: {} msgs, {} gaps, {} dups, {} OOO, seq range: {:?} - {:?}",
+                        unit, total, gaps, dups, ooo, min_seq, max_seq);
+            }
+
+            port_stats.reset_rate_counters();
+        }
+
+        println!("{}", "─".repeat(90));
+        println!("Total: {} packets, {} bytes ({:.1} MB)", 
+                total_packets, total_bytes, total_bytes as f64 / (1024.0 * 1024.0));
         
-        Ok(None)
-    }
-}
-
-// Word-align for BPF
-const fn BPF_WORDALIGN(x: usize) -> usize {
-    (x + 3) & !3
-}
-
-impl Drop for BpfDevice {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
+        if !stats_map.is_empty() {
+            let avg_rate = stats_map.values()
+                .map(|s| s.get_rate().0)
+                .sum::<f64>() / stats_map.len() as f64;
+            println!("Average rate: {:.1} packets/sec across {} ports", avg_rate, stats_map.len());
         }
     }
 }
 
-// Build BPF filter program to capture UDP packets for specific ports
-fn build_bpf_filter(ports: &[u16]) -> Result<BpfProgram> {
-    // BPF instructions for: "udp and (dst port PORT1 or dst port PORT2 ...)"
-    // This is a simplified version - a complete implementation would involve
-    // translating BPF filter expressions to actual instructions
-    
-    // For educational purposes, we're creating a simple UDP filter with port checks
-    // In a production environment, you'd use libpcap's pcap_compile to create this
-    
-    // Basic UDP filter instructions (matches UDP traffic)
-    // - Check if it's an IP packet (12 bytes in, ethertype = 0x0800)
-    // - Check if protocol is UDP (23 bytes in, protocol = 17)
-    // - Check destination port against each port in our list
-    
-    let mut instructions: Vec<BpfInsn> = Vec::new();
-    
-    // Check for IP (Ethertype = 0x0800)
-    instructions.push(BpfInsn {
-        code: 0x28, // BPF_LD|BPF_H|BPF_ABS
-        jt: 0,
-        jf: 0,
-        k: 12, // Ethertype offset
-    });
-    instructions.push(BpfInsn {
-        code: 0x15, // BPF_JEQ|BPF_K
-        jt: 0,
-        jf: (ports.len() * 2 + 3) as u8, // Skip to the end if not IP
-        k: 0x0800, // Ethertype for IPv4
-    });
-    
-    // Check for UDP (Protocol = 17)
-    instructions.push(BpfInsn {
-        code: 0x30, // BPF_LD|BPF_B|BPF_ABS
-        jt: 0,
-        jf: 0,
-        k: 23, // Protocol offset in IPv4
-    });
-    instructions.push(BpfInsn {
-        code: 0x15, // BPF_JEQ|BPF_K
-        jt: 0,
-        jf: (ports.len() * 2 + 1) as u8, // Skip to the end if not UDP
-        k: 17, // Protocol number for UDP
-    });
-    
-    // Load UDP destination port (offset depends on IPv4 header length)
-    instructions.push(BpfInsn {
-        code: 0x30, // BPF_LD|BPF_B|BPF_ABS
-        jt: 0,
-        jf: 0,
-        k: 14, // IPv4 header offset to get IHL
-    });
-    instructions.push(BpfInsn {
-        code: 0x54, // BPF_ALU|BPF_AND|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 0x0f, // Mask for IHL
-    });
-    instructions.push(BpfInsn {
-        code: 0x04, // BPF_ALU|BPF_MUL|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 4, // IHL is in 32-bit words
-    });
-    instructions.push(BpfInsn {
-        code: 0x07, // BPF_ALU|BPF_ADD|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 14, // Add Ethernet header length
-    });
-    instructions.push(BpfInsn {
-        code: 0x02, // BPF_ST
-        jt: 0,
-        jf: 0,
-        k: 0, // Store to scratch memory
-    });
-    
-    // Check destination port
-    instructions.push(BpfInsn {
-        code: 0x60, // BPF_LD|BPF_MEM
-        jt: 0,
-        jf: 0,
-        k: 0, // Load from scratch memory
-    });
-    instructions.push(BpfInsn {
-        code: 0x07, // BPF_ALU|BPF_ADD|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 2, // Add offset to destination port field
-    });
-    instructions.push(BpfInsn {
-        code: 0xb1, // BPF_LDX|BPF_MSH|BPF_B
-        jt: 0,
-        jf: 0,
-        k: 14, // Load IP header length
-    });
-    instructions.push(BpfInsn {
-        code: 0x48, // BPF_LD|BPF_W|BPF_IMM
-        jt: 0,
-        jf: 0,
-        k: 0, // Reset accumulator
-    });
-    
-    // For each port, add a check
-    for port in ports {
-        instructions.push(BpfInsn {
-            code: 0x40, // BPF_LD|BPF_H|BPF_IND
-            jt: 0,
-            jf: 0,
-            k: 0, // Load UDP destination port (indexed)
-        });
-        instructions.push(BpfInsn {
-            code: 0x15, // BPF_JEQ|BPF_K
-            jt: 3, // Jump to "return true" if matches
-            jf: 0, // Continue to next check
-            k: *port as u32, // Port to match
-        });
-    }
-    
-    // Default return false (if no port matches)
-    instructions.push(BpfInsn {
-        code: 0x06, // BPF_RET|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 0, // Return 0 (false)
-    });
-    
-    // Return true (with full packet length)
-    instructions.push(BpfInsn {
-        code: 0x06, // BPF_RET|BPF_K
-        jt: 0,
-        jf: 0,
-        k: 0xffff, // Return entire packet
-    });
-    
-    // Create BPF program
-    let program = BpfProgram {
-        bf_len: instructions.len() as u32,
-        bf_insns: Box::leak(instructions.into_boxed_slice()).as_ptr(),
-    };
-    
-    Ok(program)
-}
-
-async fn setup_bpf_receiver(
-    interface: &str,
-    ports: &[u16],
-    stats_tx: mpsc::Sender<(u16, PortStats)>,
-) -> Result<()> {
-    // Check if running as root (BPF typically requires root privileges)
-    #[cfg(unix)]
-    {
-        // Check if running as root using libc function
-        let euid = unsafe { libc::geteuid() };
-        if euid != 0 {
-            warn!("Not running as root (EUID: {}). BPF access typically requires root privileges.", euid);
-            warn!("Try running with sudo if you encounter permission errors.");
-        }
-    }
-    
-    // Open BPF device and set up filters
-    let mut bpf = BpfDevice::open(interface, 1024 * 1024, ports)?; // 1MB buffer
-    
-    info!("BPF receiver started on interface {} for ports: {:?}", interface, ports);
-    
-    // Create stats objects for each port
-    let mut port_stats: HashMap<u16, PortStats> = HashMap::new();
-    for &port in ports {
-        port_stats.insert(port, PortStats::new(port));
-    }
-    
-    // Main receive loop
-    loop {
-        match bpf.read_packet() {
-            Ok(Some((payload, dest_port))) => {
-                // Get or create stats for this port
-                let stats = port_stats.entry(dest_port).or_insert_with(|| PortStats::new(dest_port));
-                
-                // Record the packet
-                stats.record_packet(payload.len(), &payload);
-                
-                // Send updated stats
-                if let Err(e) = stats_tx.send((dest_port, stats.clone())).await {
-                    error!("Failed to send stats: {}", e);
-                }
-            }
-            Ok(None) => {
-                // No packet available, wait a bit
-                tokio::time::sleep(Duration::from_micros(100)).await;
-            }
-            Err(e) => {
-                error!("Error reading packet: {}", e);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-}
-
-async fn stats_reporter(
-    mut stats_rx: mpsc::Receiver<(u16, PortStats)>,
-    interval: u64,
-) {
-    let mut port_stats: HashMap<u16, PortStats> = HashMap::new();
-    let mut last_report = Instant::now();
-    
-    while let Some((port, stats)) = stats_rx.recv().await {
-        port_stats.insert(port, stats);
-        
-        let now = Instant::now();
-        if now.duration_since(last_report).as_secs() >= interval {
-            // Report all port statistics
-            info!("=== Packet Reception Report ===");
-            
-            let mut total_packets = 0;
-            let mut total_bytes = 0;
-            let mut total_missing = 0;
-            let mut total_out_of_order = 0;
-            let mut total_duplicates = 0;
-            
-            // Get reports from all ports
-            let mut reports = Vec::new();
-            for (_, stats) in port_stats.iter_mut() {
-                reports.push(stats.get_report());
-                total_packets += stats.packets_received;
-                total_bytes += stats.bytes_received;
-                total_missing += stats.missing_sequences;
-                total_out_of_order += stats.out_of_order_sequences;
-                total_duplicates += stats.duplicate_sequences;
-            }
-            
-            // Sort reports by port
-            reports.sort();
-            for report in reports {
-                info!("{}", report);
-            }
-            
-            // Show summary
-            info!(
-                "TOTAL   : {:8} packets, {:10} bytes, missing: {}, out-of-order: {}, duplicates: {}",
-                total_packets,
-                total_bytes,
-                total_missing,
-                total_out_of_order,
-                total_duplicates
-            );
-            info!("==============================");
-            
-            last_report = now;
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Parse arguments
+fn main() -> Result<()> {
     let args = Args::parse();
-    
+
     // Initialize logging
+    let log_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
-        .with_max_level(if args.verbose { 
-            tracing::Level::DEBUG 
-        } else { 
-            tracing::Level::INFO 
-        })
+        .with_env_filter(log_level)
         .init();
-    
-    info!("Starting CBOE Packet Receiver with BPF capture");
-    
-    // Parse ports
+
     let ports: Vec<u16> = args.ports
         .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
-    
+        .map(|s| s.trim().parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Invalid port number: {}", e))?;
+
     if ports.is_empty() {
-        error!("No valid ports specified");
-        return Ok(());
+        return Err(anyhow::anyhow!("At least one port must be specified"));
     }
+
+    info!("Starting CBOE Packet Receiver");
+    info!("Listening on interface {} for {} ports: {:?}", args.interface, ports.len(), ports);
     
-    info!("Capturing UDP traffic on interface {} for {} ports: {:?}", args.interface, ports.len(), ports);
+    // Setup statistics tracking
+    let stats = Arc::new(Mutex::new(HashMap::new()));
     
-    // Create stats channel
-    let (stats_tx, stats_rx) = mpsc::channel(1000);
-    
-    // Start stats reporter
-    let reporter_handle = tokio::spawn(stats_reporter(stats_rx, args.interval));
-    
-    // Start BPF receiver
-    let receiver_handle = tokio::spawn(async move {
-        if let Err(e) = setup_bpf_receiver(&args.interface, &ports, stats_tx).await {
-            error!("BPF receiver error: {}", e);
+    // Initialize stats for each port
+    {
+        let mut stats_map = stats.lock().unwrap();
+        for &port in &ports {
+            stats_map.insert(port, PortStats::new(port));
         }
-    });
-    
-    // Setup timeout if specified
-    if args.time > 0 {
-        tokio::time::sleep(Duration::from_secs(args.time)).await;
-        info!("Time limit reached, shutting down");
-    } else {
-        // Wait for Ctrl+C
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        
-        // Use a separate variable for the handler
-        let shutdown_sender = Arc::new(Mutex::new(Some(shutdown_tx)));
-        let shutdown_sender_clone = shutdown_sender.clone();
-        
-        ctrlc::set_handler(move || {
-            if let Some(tx) = shutdown_sender_clone.lock().unwrap().take() {
-                let _ = tx.send(());
-            }
-        })?;
-        
-        shutdown_rx.await?;
-        info!("Received Ctrl+C, shutting down");
     }
-    
-    // Clean shutdown
-    receiver_handle.abort();
-    reporter_handle.abort();
-    
+
+    // Spawn listener threads for each port
+    let mut handles = vec![];
+    for port in ports {
+        let stats_clone = Arc::clone(&stats);
+        let bind_ip = args.interface.clone();
+        
+        let handle = thread::spawn(move || {
+            if let Err(e) = listen_on_port(port, bind_ip, stats_clone) {
+                error!("Listener for port {} failed: {}", port, e);
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Setup Ctrl+C handler
+    let stats_for_shutdown = Arc::clone(&stats);
+    ctrlc::set_handler(move || {
+        info!("Received Ctrl+C, shutting down");
+        print_statistics(&stats_for_shutdown);
+        std::process::exit(0);
+    })?;
+
+    // Statistics reporting loop
+    let start_time = Instant::now();
+    let run_duration = if args.time > 0 { 
+        Some(Duration::from_secs(args.time)) 
+    } else { 
+        None 
+    };
+
+    loop {
+        thread::sleep(Duration::from_secs(args.interval));
+        
+        // Check if we should stop
+        if let Some(duration) = run_duration {
+            if start_time.elapsed() >= duration {
+                info!("Run duration ({} seconds) completed", args.time);
+                break;
+            }
+        }
+
+        print_statistics(&stats);
+    }
+
+    // Final statistics
     info!("CBOE Packet Receiver completed");
+    print_statistics(&stats);
+
     Ok(())
 }
