@@ -1,0 +1,17 @@
+[package]
+name = "cboe-pcap-receiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+socket2 = "0.5"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ctrlc = "3.2"
+chrono = "0.4"
+libc = "0.2"
+nix = { version = "0.27", features = ["user"] }
+pnet = "0.35"
