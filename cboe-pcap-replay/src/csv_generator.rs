@@ -18,21 +18,44 @@ pub struct CsvRecord {
     pub hdr_unit: u8,
     pub hdr_sequence: u32,
     pub msg_length: u8,
-    pub order_id: String,
-    pub side: Option<char>,
-    pub shares: Option<u64>,
+    // Trading Status fields
+    pub trading_status: Option<char>,
+    pub market_id_code: Option<String>,
+    // Add Order fields
+    pub order_id: Option<String>,
+    pub side_indicator: Option<char>,
+    pub quantity: Option<u32>,
     pub price: Option<u64>,
-    pub display: Option<char>,
     pub participant_id: Option<String>,
-    pub time_in_force: Option<u32>,
-    pub firm: Option<String>,
-    pub status: Option<char>,
+    // Order Executed fields
+    pub executed_quantity: Option<u32>,
     pub execution_id: Option<String>,
-    pub liquidity_flag: Option<char>,
-    pub match_number: Option<u64>,
-    pub trade_id: Option<String>,
-    pub trade_price: Option<u64>,
-    pub trade_quantity: Option<u64>,
+    pub contra_order_id: Option<String>,
+    pub contra_participant_id: Option<String>,
+    // Order Executed at Price fields
+    pub execution_type: Option<char>,
+    // Reduce Size fields
+    pub cancelled_quantity: Option<u32>,
+    // Trade fields
+    pub trade_type: Option<char>,
+    pub trade_designation: Option<char>,
+    pub trade_report_type: Option<char>,
+    pub trade_transaction_time: Option<u64>,
+    pub flags: Option<u8>,
+    // Calculated Value fields
+    pub value_category: Option<char>,
+    pub value: Option<u64>,
+    pub value_timestamp: Option<u64>,
+    // Auction fields
+    pub auction_type: Option<char>,
+    pub buy_shares: Option<u32>,
+    pub sell_shares: Option<u32>,
+    pub indicative_price: Option<u64>,
+    pub auction_price: Option<u64>,
+    pub auction_shares: Option<u32>,
+    // Trade Break fields
+    pub original_execution_id: Option<String>,
+    pub break_reason: Option<char>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +63,6 @@ struct OrderBook {
     orders: HashMap<String, Order>,
     next_order_id: u64,
     next_execution_id: u64,
-    next_match_number: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,11 +70,9 @@ struct Order {
     order_id: String,
     symbol: String,
     side: char,
-    shares: u64,
+    quantity: u32,
     price: u64,
-    display: char,
     participant_id: String,
-    firm: String,
     timestamp: u64,
 }
 
@@ -80,7 +100,6 @@ impl OrderBook {
             orders: HashMap::new(),
             next_order_id: 1,
             next_execution_id: 1,
-            next_match_number: 1,
         }
     }
 
@@ -91,15 +110,8 @@ impl OrderBook {
     }
 
     fn next_execution_id(&mut self) -> String {
-        let id = format!("{:012}", to_base36(self.next_execution_id));
+        let id = format!("{:09}", to_base36(self.next_execution_id));
         self.next_execution_id += 1;
-        id
-    }
-
-
-    fn next_match_number(&mut self) -> u64 {
-        let id = self.next_match_number;
-        self.next_match_number += 1;
         id
     }
 
@@ -142,19 +154,74 @@ fn price_to_cboe_format(price_dollars: f64) -> u64 {
 
 fn generate_realistic_price(symbol: &str, rng: &mut ThreadRng) -> f64 {
     let base_price = match symbol {
-        "AAPL" => 150.0,
-        "MSFT" => 300.0,
-        "GOOGL" => 2800.0,
-        "TSLA" => 200.0,
-        "AMZN" => 3200.0,
-        "META" => 350.0,
-        "NVDA" => 800.0,
-        "NFLX" => 450.0,
-        _ => 100.0,
+        // Major Australian banks
+        "ANZ" => 28.50,    // Australia and New Zealand Banking Group
+        "CBA" => 105.00,   // Commonwealth Bank of Australia
+        "NAB" => 35.20,    // National Australia Bank
+        "WBC" => 26.80,    // Westpac Banking Corporation
+        // Australian miners
+        "BHP" => 45.60,    // BHP Billiton
+        "RIO" => 125.40,   // Rio Tinto
+        "FMG" => 22.15,    // Fortescue Metals Group
+        "NCM" => 28.90,    // Newcrest Mining
+        // Australian tech and telecom
+        "TLS" => 4.20,     // Telstra Corporation
+        "WOW" => 38.50,    // Woolworths Group
+        "CSL" => 285.00,   // CSL Limited
+        "TCL" => 14.75,    // Transurban Group
+        // Australian retail and services
+        "COL" => 18.90,    // Coles Group
+        "WES" => 65.40,    // Wesfarmers
+        "QAN" => 6.25,     // Qantas Airways
+        "SYD" => 8.45,     // Sydney Airport
+        _ => 25.00,         // Default for unknown AU symbols
     };
     
     let variation = rng.gen_range(-0.05..0.05);
     base_price * (1.0 + variation)
+}
+
+fn create_empty_record() -> CsvRecord {
+    CsvRecord {
+        timestamp_ns: 0,
+        message_type: String::new(),
+        port: 0,
+        symbol: String::new(),
+        hdr_length: 0,
+        hdr_count: 0,
+        hdr_unit: 0,
+        hdr_sequence: 0,
+        msg_length: 0,
+        trading_status: None,
+        market_id_code: None,
+        order_id: None,
+        side_indicator: None,
+        quantity: None,
+        price: None,
+        participant_id: None,
+        executed_quantity: None,
+        execution_id: None,
+        contra_order_id: None,
+        contra_participant_id: None,
+        execution_type: None,
+        cancelled_quantity: None,
+        trade_type: None,
+        trade_designation: None,
+        trade_report_type: None,
+        trade_transaction_time: None,
+        flags: None,
+        value_category: None,
+        value: None,
+        value_timestamp: None,
+        auction_type: None,
+        buy_shares: None,
+        sell_shares: None,
+        indicative_price: None,
+        auction_price: None,
+        auction_shares: None,
+        original_execution_id: None,
+        break_reason: None,
+    }
 }
 
 pub fn generate_csv(
@@ -166,7 +233,7 @@ pub fn generate_csv(
 ) -> Result<()> {
     let symbols: Vec<&str> = symbols.split(',').collect();
     
-    info!("Starting CBOE CSV generation");
+    info!("Starting CBOE PITCH CSV generation (Official Specification Compliant)");
     info!("Symbols: {:?}", symbols);
     info!("Duration: {} seconds", duration);
     info!("Output file: {}", output);
@@ -190,42 +257,28 @@ pub fn generate_csv(
           DateTime::from_timestamp_nanos(end_time_ns as i64));
 
     let participants = vec!["ARCA", "BATS", "EDGX", "NSDQ", "NYSE", "CBOE"];
-    let firms = vec!["CITD", "VIRT", "JANE", "JUMP", "GSCO", "MSCO"];
+    let market_id_codes = vec!["XASX", "CXAW", "CXAE", "CXAQ", "CXAL"];
     
     let mut message_count = 0u64;
 
-    // Generate trading status messages for market open
+    // Generate Trading Status messages for market open (0x3B)
     for symbol in &symbols {
         let unit = (message_count % units as u64) as u8 + 1;
         let port_num = port + (unit - 1) as u16;
         let sequence = sequence_tracker.next_sequence(unit);
         
-        let record = CsvRecord {
-            timestamp_ns: current_time_ns,
-            message_type: "0x31".to_string(),
-            port: port_num,
-            symbol: format!("{:<6}", symbol),
-            hdr_length: 16,
-            hdr_count: 1,
-            hdr_unit: unit,
-            hdr_sequence: sequence,
-            msg_length: 9,
-            order_id: String::new(),
-            side: None,
-            shares: None,
-            price: None,
-            display: None,
-            participant_id: None,
-            time_in_force: None,
-            firm: None,
-            status: Some('H'),
-            execution_id: None,
-            liquidity_flag: None,
-            match_number: None,
-            trade_id: None,
-            trade_price: None,
-            trade_quantity: None,
-        };
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x3B".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 22; // Header + message length
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 22;
+        record.trading_status = Some('T'); // Trading
+        record.market_id_code = Some(market_id_codes.choose(&mut rng).unwrap().to_string());
         
         writer.serialize(&record)?;
         message_count += 1;
@@ -242,137 +295,256 @@ pub fn generate_csv(
         let order_book = order_books.get_mut(*symbol).unwrap();
 
         let action = if order_book.orders.len() < 10 {
-            0
+            0 // Force add order
         } else {
             rng.gen_range(0..10)
         };
 
         match action {
-            0..=6 => {
-                // Add Order
+            0..=4 => {
+                // Add Order (0x37)
                 let order_id = order_book.next_order_id();
                 let side = if rng.gen_bool(0.5) { 'B' } else { 'S' };
-                let shares = rng.gen_range(100..10000);
+                let quantity = rng.gen_range(100..10000);
                 let price = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
-                let display = if rng.gen_bool(0.8) { 'Y' } else { 'N' };
                 let participant_id = participants.choose(&mut rng).unwrap().to_string();
-                let firm = firms.choose(&mut rng).unwrap().to_string();
 
                 let order = Order {
                     order_id: order_id.clone(),
                     symbol: symbol.to_string(),
                     side,
-                    shares,
+                    quantity,
                     price,
-                    display,
                     participant_id: participant_id.clone(),
-                    firm: firm.clone(),
                     timestamp: current_time_ns,
                 };
 
-                let record = CsvRecord {
-                    timestamp_ns: current_time_ns,
-                    message_type: "0x37".to_string(),
-                    port: port_num,
-                    symbol: format!("{:<6}", symbol),
-                    hdr_length: 42,
-                    hdr_count: 1,
-                    hdr_unit: unit,
-                    hdr_sequence: sequence,
-                    msg_length: 34,
-                    order_id: order_id.clone(),
-                    side: Some(side),
-                    shares: Some(shares),
-                    price: Some(price),
-                    display: Some(display),
-                    participant_id: Some(participant_id),
-                    time_in_force: Some(0),
-                    firm: Some(firm),
-                    status: None,
-                    execution_id: None,
-                    liquidity_flag: None,
-                    match_number: None,
-                    trade_id: None,
-                    trade_price: None,
-                    trade_quantity: None,
-                };
+                let mut record = create_empty_record();
+                record.timestamp_ns = current_time_ns;
+                record.message_type = "0x37".to_string();
+                record.port = port_num;
+                record.symbol = format!("{:<6}", symbol);
+                record.hdr_length = 16 + 42; // Header + message length
+                record.hdr_count = 1;
+                record.hdr_unit = unit;
+                record.hdr_sequence = sequence;
+                record.msg_length = 42;
+                record.order_id = Some(order_id.clone());
+                record.side_indicator = Some(side);
+                record.quantity = Some(quantity);
+                record.price = Some(price);
+                record.participant_id = Some(participant_id);
 
                 order_book.add_order(order);
                 writer.serialize(&record)?;
             }
-            7..=8 => {
-                // Execute Order
+            5..=6 => {
+                // Order Executed (0x38)
                 if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
                     let execution_id = order_book.next_execution_id();
-                    let match_number = order_book.next_match_number();
-                    let shares_executed = std::cmp::min(order.shares, rng.gen_range(100..order.shares + 1));
+                    let executed_quantity = std::cmp::min(order.quantity, rng.gen_range(100..order.quantity + 1));
+                    let contra_order_id = format!("{:012}", to_base36(rng.gen_range(1..1000000)));
+                    let contra_participant_id = participants.choose(&mut rng).unwrap().to_string();
 
-                    let record = CsvRecord {
-                        timestamp_ns: current_time_ns,
-                        message_type: "0x38".to_string(),
-                        port: port_num,
-                        symbol: format!("{:<6}", symbol),
-                        hdr_length: 37,
-                        hdr_count: 1,
-                        hdr_unit: unit,
-                        hdr_sequence: sequence,
-                        msg_length: 29,
-                        order_id: order.order_id.clone(),
-                        side: None,
-                        shares: Some(shares_executed),
-                        price: None,
-                        display: None,
-                        participant_id: None,
-                        time_in_force: None,
-                        firm: None,
-                        status: None,
-                        execution_id: Some(execution_id),
-                        liquidity_flag: Some('A'),
-                        match_number: Some(match_number),
-                        trade_id: None,
-                        trade_price: None,
-                        trade_quantity: None,
-                    };
+                    let mut record = create_empty_record();
+                    record.timestamp_ns = current_time_ns;
+                    record.message_type = "0x38".to_string();
+                    record.port = port_num;
+                    record.symbol = format!("{:<6}", symbol);
+                    record.hdr_length = 16 + 43; // Header + message length
+                    record.hdr_count = 1;
+                    record.hdr_unit = unit;
+                    record.hdr_sequence = sequence;
+                    record.msg_length = 43;
+                    record.order_id = Some(order.order_id.clone());
+                    record.executed_quantity = Some(executed_quantity);
+                    record.execution_id = Some(execution_id);
+                    record.contra_order_id = Some(contra_order_id);
+                    record.contra_participant_id = Some(contra_participant_id);
+
                     writer.serialize(&record)?;
 
-                    if shares_executed >= order.shares {
+                    if executed_quantity >= order.quantity {
                         order_book.remove_order(&order.order_id);
                     }
                 }
             }
-            _ => {
-                // Delete Order
+            7 => {
+                // Reduce Size (0x39)
                 if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
-                    let record = CsvRecord {
-                        timestamp_ns: current_time_ns,
-                        message_type: "0x3C".to_string(),
-                        port: port_num,
-                        symbol: format!("{:<6}", symbol),
-                        hdr_length: 20,
-                        hdr_count: 1,
-                        hdr_unit: unit,
-                        hdr_sequence: sequence,
-                        msg_length: 12,
-                        order_id: order.order_id.clone(),
-                        side: None,
-                        shares: None,
-                        price: None,
-                        display: None,
-                        participant_id: None,
-                        time_in_force: None,
-                        firm: None,
-                        status: None,
-                        execution_id: None,
-                        liquidity_flag: None,
-                        match_number: None,
-                        trade_id: None,
-                        trade_price: None,
-                        trade_quantity: None,
-                    };
+                    let cancelled_quantity = rng.gen_range(1..=order.quantity / 2);
+
+                    let mut record = create_empty_record();
+                    record.timestamp_ns = current_time_ns;
+                    record.message_type = "0x39".to_string();
+                    record.port = port_num;
+                    record.symbol = format!("{:<6}", symbol);
+                    record.hdr_length = 16 + 22; // Header + message length
+                    record.hdr_count = 1;
+                    record.hdr_unit = unit;
+                    record.hdr_sequence = sequence;
+                    record.msg_length = 22;
+                    record.order_id = Some(order.order_id.clone());
+                    record.cancelled_quantity = Some(cancelled_quantity);
+
+                    writer.serialize(&record)?;
+                }
+            }
+            8 => {
+                // Modify Order (0x3A)
+                if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
+                    let new_quantity = rng.gen_range(100..10000);
+                    let new_price = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
+
+                    let mut record = create_empty_record();
+                    record.timestamp_ns = current_time_ns;
+                    record.message_type = "0x3A".to_string();
+                    record.port = port_num;
+                    record.symbol = format!("{:<6}", symbol);
+                    record.hdr_length = 16 + 31; // Header + message length
+                    record.hdr_count = 1;
+                    record.hdr_unit = unit;
+                    record.hdr_sequence = sequence;
+                    record.msg_length = 31;
+                    record.order_id = Some(order.order_id.clone());
+                    record.quantity = Some(new_quantity);
+                    record.price = Some(new_price);
+
+                    writer.serialize(&record)?;
+                }
+            }
+            _ => {
+                // Delete Order (0x3C)
+                if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
+                    let mut record = create_empty_record();
+                    record.timestamp_ns = current_time_ns;
+                    record.message_type = "0x3C".to_string();
+                    record.port = port_num;
+                    record.symbol = format!("{:<6}", symbol);
+                    record.hdr_length = 16 + 18; // Header + message length
+                    record.hdr_count = 1;
+                    record.hdr_unit = unit;
+                    record.hdr_sequence = sequence;
+                    record.msg_length = 18;
+                    record.order_id = Some(order.order_id.clone());
+
                     writer.serialize(&record)?;
                     order_book.remove_order(&order.order_id);
                 }
             }
+        }
+
+        // Occasionally generate Trade messages (0x3D)
+        if rng.gen_range(0..100) < 5 { // 5% chance
+            let quantity = rng.gen_range(100..10000);
+            let price = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
+            let execution_id = order_book.next_execution_id();
+            let order_id = format!("{:012}", to_base36(rng.gen_range(1..1000000)));
+            let contra_order_id = format!("{:012}", to_base36(rng.gen_range(1..1000000)));
+            let participant_id = participants.choose(&mut rng).unwrap().to_string();
+            let contra_participant_id = participants.choose(&mut rng).unwrap().to_string();
+
+            let mut record = create_empty_record();
+            record.timestamp_ns = current_time_ns;
+            record.message_type = "0x3D".to_string();
+            record.port = port_num;
+            record.symbol = format!("{:<6}", symbol);
+            record.hdr_length = 16 + 72; // Header + message length
+            record.hdr_count = 1;
+            record.hdr_unit = unit;
+            record.hdr_sequence = sequence_tracker.next_sequence(unit);
+            record.msg_length = 72;
+            record.quantity = Some(quantity);
+            record.price = Some(price);
+            record.execution_id = Some(execution_id);
+            record.order_id = Some(order_id);
+            record.contra_order_id = Some(contra_order_id);
+            record.participant_id = Some(participant_id);
+            record.contra_participant_id = Some(contra_participant_id);
+            record.trade_type = Some('N'); // Normal matching logic
+            record.trade_designation = Some('C'); // CXAC (Limit)
+            record.trade_report_type = Some(' '); // On-exchange
+            record.trade_transaction_time = Some(0);
+            record.flags = Some(0);
+
+            writer.serialize(&record)?;
+            message_count += 1;
+        }
+
+        // Occasionally generate Order Executed at Price messages (0x58) for auctions
+        if rng.gen_range(0..200) < 1 { // 0.5% chance
+            if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
+                let executed_quantity = std::cmp::min(order.quantity, rng.gen_range(100..order.quantity + 1));
+                let execution_id = order_book.next_execution_id();
+                let auction_price = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
+
+                let mut record = create_empty_record();
+                record.timestamp_ns = current_time_ns;
+                record.message_type = "0x58".to_string();
+                record.port = port_num;
+                record.symbol = format!("{:<6}", symbol);
+                record.hdr_length = 16 + 29; // Header + message length
+                record.hdr_count = 1;
+                record.hdr_unit = unit;
+                record.hdr_sequence = sequence_tracker.next_sequence(unit);
+                record.msg_length = 29;
+                record.order_id = Some(order.order_id.clone());
+                record.executed_quantity = Some(executed_quantity);
+                record.execution_id = Some(execution_id);
+                record.price = Some(auction_price);
+
+                writer.serialize(&record)?;
+                message_count += 1;
+                
+                if executed_quantity >= order.quantity {
+                    order_book.remove_order(&order.order_id);
+                }
+            }
+        }
+
+        // Occasionally generate Trade Break messages (0x3E)
+        if rng.gen_range(0..5000) < 1 { // 0.02% chance
+            let original_execution_id = format!("{:09}", to_base36(rng.gen_range(1..1000000)));
+            let break_reasons = ['E', 'C', 'D']; // Error, Consent, Duplicate
+            let break_reason = *break_reasons.choose(&mut rng).unwrap();
+
+            let mut record = create_empty_record();
+            record.timestamp_ns = current_time_ns;
+            record.message_type = "0x3E".to_string();
+            record.port = port_num;
+            record.symbol = format!("{:<6}", symbol);
+            record.hdr_length = 16 + 17; // Header + message length
+            record.hdr_count = 1;
+            record.hdr_unit = unit;
+            record.hdr_sequence = sequence_tracker.next_sequence(unit);
+            record.msg_length = 17;
+            record.original_execution_id = Some(original_execution_id);
+            record.break_reason = Some(break_reason);
+
+            writer.serialize(&record)?;
+            message_count += 1;
+        }
+
+        // Occasionally generate Calculated Value messages (0xE3)
+        if rng.gen_range(0..1000) < 1 { // 0.1% chance
+            let value = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
+
+            let mut record = create_empty_record();
+            record.timestamp_ns = current_time_ns;
+            record.message_type = "0xE3".to_string();
+            record.port = port_num;
+            record.symbol = format!("{:<6}", symbol);
+            record.hdr_length = 16 + 33; // Header + message length
+            record.hdr_count = 1;
+            record.hdr_unit = unit;
+            record.hdr_sequence = sequence_tracker.next_sequence(unit);
+            record.msg_length = 33;
+            record.value_category = Some('1'); // Closing price
+            record.value = Some(value);
+            record.value_timestamp = Some(current_time_ns);
+
+            writer.serialize(&record)?;
+            message_count += 1;
         }
 
         message_count += 1;
@@ -383,9 +555,56 @@ pub fn generate_csv(
         }
     }
 
+    // Generate Unit Clear messages (0x97) occasionally for recovery scenarios
+    if rng.gen_range(0..10) == 0 { // 10% chance per session
+        for unit_num in 1..=units {
+            let mut record = create_empty_record();
+            record.timestamp_ns = current_time_ns;
+            record.message_type = "0x97".to_string();
+            record.port = port + (unit_num - 1) as u16;
+            record.symbol = format!("{:<6}", "      "); // No specific symbol for unit clear
+            record.hdr_length = 16 + 6; // Header + message length
+            record.hdr_count = 1;
+            record.hdr_unit = unit_num;
+            record.hdr_sequence = sequence_tracker.next_sequence(unit_num);
+            record.msg_length = 6;
+
+            writer.serialize(&record)?;
+            message_count += 1;
+            current_time_ns += rng.gen_range(10_000..100_000);
+        }
+    }
+
+    // Generate End of Session messages (0x2D)
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x2D".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 6; // Header + message length
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 6;
+
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += rng.gen_range(100_000..1_000_000);
+    }
+
     writer.flush()?;
     
     info!("Generated {} total messages", message_count);
+    info!("Message types generated: Trading Status (0x3B), Add Order (0x37), Order Executed (0x38)");
+    info!("                        Order Executed at Price (0x58), Reduce Size (0x39), Modify Order (0x3A)");
+    info!("                        Delete Order (0x3C), Trade (0x3D), Trade Break (0x3E)");
+    info!("                        Auction Update (0x59), Auction Summary (0x5A), Unit Clear (0x97)");
+    info!("                        Calculated Value (0xE3), End of Session (0x2D)");
     info!("CSV file written to: {}", output);
     
     Ok(())

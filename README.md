@@ -1,14 +1,14 @@
-# CBOE PCAP Suite
+# CBOE PCAP Suite - Official PITCH Specification Compliant
 
-Complete suite of tools for CBOE PITCH market data simulation, generation, and replay - now integrated into a single powerful tool with automated workflow support.
+Complete suite of tools for CBOE Australia PITCH market data simulation, generation, and replay - fully compliant with the official Cboe Australia PITCH Specification. This suite provides an integrated solution with automated workflow support for generating, converting, and replaying authentic Australian market data using real ASX symbols.
 
 ## Tools Overview
 
 ### Integrated CBOE PCAP Replayer (`cboe-pcap-replay`)
-**All-in-one tool** with three powerful modes:
-- **Generate**: Creates realistic CBOE PITCH market data in CSV format
-- **Convert**: Converts CSV data to PCAP format with proper encoding
-- **Replay**: High-performance sequential packet replayer with ordering guarantee
+**All-in-one tool** with three powerful modes, fully compliant with the official PITCH specification:
+- **Generate**: Creates realistic CBOE PITCH market data in CSV format with all official message types (0x3B, 0x37, 0x38, 0x58, 0x39, 0x3A, 0x3C, 0x3D, 0x3E, 0x59, 0x5A, 0x97, 0xE3, 0x2D)
+- **Convert**: Converts CSV data to PCAP format with proper PITCH message encoding and sequenced unit headers
+- **Replay**: High-performance sequential packet replayer with per-port ordering guarantee
 
 ### CBOE PCAP Receiver (`cboe-pcap-receiver`)
 Real-time receiver for monitoring and validating replayed packets with comprehensive analysis.
@@ -27,7 +27,7 @@ cargo build --release
 
 # 1. Generate realistic CSV market data
 ./target/release/cboe-pcap-replay generate \
-  --symbols AAPL,MSFT,GOOGL,TSLA \
+  --symbols ANZ,CBA,NAB,WBC \
   --duration 300 \
   --output market_data.csv
 
@@ -54,11 +54,11 @@ cd cboe-pcap-receiver && cargo build --release && cd ..
 ```
 
 The automation script will:
-1. Generate 60 seconds of realistic market data
-2. Convert it to PCAP format
-3. Start the receiver in background
-4. Replay the data and analyze results
-5. Provide comprehensive summary
+1. Generate 60 seconds of realistic Australian market data with all official PITCH message types
+2. Convert it to PCAP format with proper PITCH message encoding
+3. Start the receiver in background to monitor packet reception
+4. Replay the data with correct sequencing and analyze results
+5. Provide comprehensive summary showing message type distribution and compliance
 
 ## CBOE PCAP Replayer
 
@@ -77,16 +77,19 @@ Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ 
 - **Thống kê chi tiết**: Báo cáo tiến trình, tốc độ và tổng kết khi hoàn thành
 - **Tương thích đa nền tảng**: Hỗ trợ trên Linux, Windows và macOS với hiệu suất tối ưu
 
-## Kiến trúc
+## Architecture - PITCH Specification Compliant
 
 ### CBOE PCAP Replayer (Sender)
 
-- **Raw Socket**: Xây dựng và gửi gói tin IP+UDP trực tiếp, bypass các giới hạn của UDP socket thông thường
-- **Per-port ring buffer**: Mỗi port có một hàng đợi riêng để đảm bảo thứ tự tuần tự tuyệt đối trên từng port
-- **Thread pool tối ưu**: Tự động điều chỉnh số lượng thread dựa trên số port phát hiện được
-- **CPU affinity đa nền tảng**: Phát hiện và gắn thread với CPU core trên các hệ điều hành hỗ trợ
-- **Cấu trúc dữ liệu lock-free**: Sử dụng crossbeam và dashmap để giảm thiểu tranh chấp giữa các thread
-- **Báo cáo thông minh**: Hiển thị tiến trình, tốc độ và phân tích hiệu suất trong thời gian thực
+- **PITCH Message Encoding**: Proper binary encoding of all official PITCH message types according to specification
+- **Sequenced Unit Headers**: Correct implementation of 8-byte headers with length, count, unit, and sequence fields
+- **Per-port ring buffer**: Each port has a dedicated queue to ensure absolute sequential ordering per port
+- **Thread pool optimization**: Automatically adjusts thread count based on detected ports
+- **CPU affinity multi-platform**: Detects and binds threads to CPU cores on supported operating systems
+- **Lock-free data structures**: Uses crossbeam and dashmap to minimize thread contention
+- **Intelligent reporting**: Real-time display of progress, rate, and performance analysis
+- **Base36 Encoding**: Proper encoding of Order IDs and Execution IDs as per PITCH specification
+- **Little Endian Binary Format**: Correct byte ordering for all numeric fields as specified
 
 ### CBOE PCAP Receiver (Receiver)
 
@@ -99,8 +102,9 @@ Công cụ hiệu năng cao để phát lại dữ liệu UDP Market Order từ 
 
 ### Requirements
 
-- Rust 2024 Edition
+- Rust 2021 Edition (corrected from invalid 2024 edition)
 - libpcap-dev (or equivalent on your OS)
+- Compliance with Cboe Australia PITCH Specification
 
 ```bash
 # Install libpcap
@@ -127,21 +131,30 @@ Compiled binaries will be available in each tool's `target/release/` directory.
 
 ## CBOE PITCH Message Support
 
-All tools support the following CBOE PITCH message types:
+All tools now fully comply with the official Cboe Australia PITCH Specification. The following message types are supported:
 
-- **Trading Status (0x31)**: Market open/close states
-- **Add Order (0x37)**: New orders on book
-- **Order Executed (0x38)**: Order fills  
-- **Trade (0x3D)**: Off-exchange trades
-- **Delete Order (0x3C)**: Order cancellations
+- **Trading Status (0x3B)**: Market status information, timestamps, symbol, trading status, market ID code
+- **Add Order (0x37)**: New order book entries with timestamps, order ID, side, quantity, symbol, price, participant ID
+- **Order Executed (0x38)**: Order executions with timestamps, order ID, executed quantity, execution ID, contra order ID, contra participant ID
+- **Order Executed at Price (0x58)**: Auction executions with timestamps, order ID, executed quantity, execution ID, auction price
+- **Reduce Size (0x39)**: Order quantity reductions with timestamps, order ID, cancelled quantity
+- **Modify Order (0x3A)**: Order modifications with timestamps, order ID, new quantity, new price
+- **Delete Order (0x3C)**: Order cancellations with timestamps, order ID
+- **Trade (0x3D)**: On-exchange and off-exchange trade reports with complete trade details including participants, trade type, designation
+- **Trade Break (0x3E)**: Trade cancellations and corrections with timestamps, original execution ID, break reason
+- **Auction Update (0x59)**: Pre-open/pre-close auction status with buy/sell shares and indicative price
+- **Auction Summary (0x5A)**: Final auction results with auction price and shares
+- **Unit Clear (0x97)**: Clear all orders for unit during recovery events
+- **Calculated Value (0xE3)**: Index/NAV values with timestamps, symbol, value category, calculated value
+- **End of Session (0x2D)**: Session termination messages
 
 ## Workflow Examples
 
 ### Generate and Test Market Data
 
 ```bash
-# Generate 1 hour of AAPL,MSFT data
-cboe-pcap-replay generate --symbols AAPL,MSFT --duration 3600 --output market.csv
+# Generate 1 hour of ANZ,CBA data
+cboe-pcap-replay generate --symbols ANZ,CBA --duration 3600 --output market.csv
 
 # Convert to PCAP
 cboe-pcap-replay convert --input market.csv --output market.pcap
@@ -154,7 +167,7 @@ cboe-pcap-replay replay --file market.pcap --target 127.0.0.1 --rate 1000
 
 ```bash  
 # Generate large dataset
-cboe-pcap-replay generate --symbols AAPL,MSFT,GOOGL,TSLA,AMZN --duration 28800 --output full_day.csv
+cboe-pcap-replay generate --symbols ANZ,CBA,NAB,WBC,BHP --duration 28800 --output full_day.csv
 
 # Convert with custom network settings
 cboe-pcap-replay convert --input full_day.csv --output full_day.pcap --dest-ip 239.1.1.1
@@ -173,7 +186,7 @@ cboe-pcap-replay generate [OPTIONS]
 ```
 
 **Options:**
-- `-s, --symbols <SYMBOLS>`: Comma-separated symbols (default: AAPL,MSFT,GOOGL,TSLA,AMZN,META,NVDA,NFLX)
+- `-s, --symbols <SYMBOLS>`: Comma-separated symbols (default: ANZ,CBA,NAB,WBC,BHP,RIO,FMG,NCM,TLS,WOW,CSL,TCL)
 - `-d, --duration <DURATION>`: Duration in seconds (default: 3600)
 - `-o, --output <OUTPUT>`: Output CSV file (default: market_data.csv)
 - `-p, --port <PORT>`: Base port number (default: 30501)
@@ -181,7 +194,7 @@ cboe-pcap-replay generate [OPTIONS]
 
 **Example:**
 ```bash
-./cboe-pcap-replay generate --symbols AAPL,MSFT --duration 300 --output my_data.csv
+./cboe-pcap-replay generate --symbols ANZ,CBA,BHP --duration 300 --output my_data.csv
 ```
 
 ### Convert Command
@@ -239,7 +252,7 @@ If running from source:
 
 ```bash
 # Generate data
-cargo run --release -- generate --symbols AAPL,MSFT --duration 300
+cargo run --release -- generate --symbols ANZ,CBA --duration 300
 
 # Convert to PCAP  
 cargo run --release -- convert --input market_data.csv --output market_data.pcap

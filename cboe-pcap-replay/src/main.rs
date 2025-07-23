@@ -35,7 +35,7 @@ enum Commands {
     /// Generate realistic CBOE PITCH market data in CSV format
     Generate {
         /// Comma-separated list of symbols to generate data for
-        #[arg(short, long, default_value = "AAPL,MSFT,GOOGL,TSLA,AMZN,META,NVDA,NFLX")]
+        #[arg(short, long, default_value = "ANZ,CBA,NAB,WBC,BHP,RIO,FMG,NCM,TLS,WOW,CSL,TCL")]
         symbols: String,
 
         /// Duration to generate data for (in seconds)
