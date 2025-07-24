@@ -1,6 +1,7 @@
 # Build directories
 /cboe-pcap-receiver/target
 /cboe-pcap-replay/target
+/cboe-pcap-replay-old/target
 target/
 
 # Generated data files - prevent large files
