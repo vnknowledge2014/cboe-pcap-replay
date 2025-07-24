@@ -1,11 +1,17 @@
 use anyhow::Result;
 use clap::Parser;
 use std::collections::HashMap;
-use std::net::UdpSocket;
+use std::net::{IpAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::thread;
 use tracing::{error, info, warn, debug};
+
+mod packet;
+mod high_performance;
+mod high_performance_receiver;
+
+use high_performance_receiver::{FluxOptimizedReceiver, ReceiverStatistics};
 
 #[derive(Parser, Debug)]
 #[command(name = "cboe-pcap-receiver")]
@@ -27,9 +33,13 @@ struct Args {
     #[arg(short = 'r', long, default_value = "5")]
     interval: u64,
 
-    /// Verbose logging
-    #[arg(short, long)]
+    /// Verbose logging (default: false)
+    #[arg(short, long, default_value = "false")]
     verbose: bool,
+
+    /// Use flux-optimized high-performance receiver (default: false)
+    #[arg(long, default_value = "false")]
+    flux_optimized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +50,7 @@ struct PortStats {
     last_report_time: Instant,
     last_report_packets: u64,
     last_report_bytes: u64,
-    max_gap_ms: u64,
+    _max_gap_ms: u64,
     sequences_seen: HashMap<u8, SequenceTracker>,
     first_packet_time: Option<Instant>,
     last_packet_time: Option<Instant>,
@@ -119,7 +129,7 @@ impl PortStats {
             last_report_time: Instant::now(),
             last_report_packets: 0,
             last_report_bytes: 0,
-            max_gap_ms: 0,
+            _max_gap_ms: 0,
             sequences_seen: HashMap::new(),
             first_packet_time: None,
             last_packet_time: None,
@@ -135,8 +145,8 @@ impl PortStats {
         
         if let Some(last_time) = self.last_packet_time {
             let gap_ms = now.duration_since(last_time).as_millis() as u64;
-            if gap_ms > self.max_gap_ms {
-                self.max_gap_ms = gap_ms;
+            if gap_ms > self._max_gap_ms {
+                self._max_gap_ms = gap_ms;
             }
         }
         
@@ -285,7 +295,7 @@ fn print_statistics(stats: &Arc<Mutex<HashMap<u16, PortStats>>>) {
                     port_stats.bytes_received,
                     pkt_rate,
                     mb_rate,
-                    port_stats.max_gap_ms,
+                    port_stats._max_gap_ms,
                     port_stats.sequences_seen.len());
 
             total_packets += port_stats.packets_received;
@@ -314,7 +324,8 @@ fn print_statistics(stats: &Arc<Mutex<HashMap<u16, PortStats>>>) {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -333,8 +344,87 @@ fn main() -> Result<()> {
         return Err(anyhow::anyhow!("At least one port must be specified"));
     }
 
-    info!("Starting CBOE Packet Receiver");
+    let bind_ip: IpAddr = args.interface.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid IP address: {}", e))?;
+
+    info!("Starting CBOE Packet Receiver ({})", 
+          if args.flux_optimized { "Flux-Optimized" } else { "Standard" });
     info!("Listening on interface {} for {} ports: {:?}", args.interface, ports.len(), ports);
+
+    if args.flux_optimized {
+        run_flux_optimized_receiver(bind_ip, ports, &args).await
+    } else {
+        run_standard_receiver(bind_ip, ports, &args).await
+    }
+}
+
+async fn run_flux_optimized_receiver(bind_ip: IpAddr, ports: Vec<u16>, args: &Args) -> Result<()> {
+    info!("Initializing flux-optimized high-performance receiver");
+    
+    // Create flux-optimized receiver
+    let receiver = Arc::new(FluxOptimizedReceiver::new(bind_ip, ports)?);
+    
+    // Setup graceful shutdown
+    let receiver_for_shutdown = receiver.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        info!("Received Ctrl+C, shutting down flux-optimized receiver");
+        receiver_for_shutdown.stop();
+    });
+    
+    // Start receiver workers
+    let worker_handles = receiver.start()?;
+    
+    // Statistics reporting loop
+    let start_time = Instant::now();
+    let run_duration = if args.time > 0 { 
+        Some(Duration::from_secs(args.time)) 
+    } else { 
+        None 
+    };
+    
+    let mut last_stats = receiver.get_stats();
+    let mut last_time = Instant::now();
+    
+    loop {
+        tokio::time::sleep(Duration::from_secs(args.interval)).await;
+        
+        // Check if we should stop
+        if let Some(duration) = run_duration {
+            if start_time.elapsed() >= duration {
+                info!("Run duration ({} seconds) completed", args.time);
+                break;
+            }
+        }
+        
+        // Print flux-optimized statistics
+        let current_stats = receiver.get_stats();
+        print_flux_statistics(&current_stats, &last_stats, last_time.elapsed().as_secs_f64());
+        
+        last_stats = current_stats;
+        last_time = Instant::now();
+    }
+    
+    // Stop receiver
+    receiver.stop();
+    
+    // Wait for worker threads
+    for (i, handle) in worker_handles.into_iter().enumerate() {
+        if let Err(e) = handle.join() {
+            warn!("Error joining worker thread {}: {:?}", i, e);
+        }
+    }
+    
+    // Final statistics
+    let final_stats = receiver.get_stats();
+    print_final_flux_statistics(&final_stats, start_time.elapsed().as_secs_f64());
+    
+    info!("Flux-optimized CBOE Packet Receiver completed");
+    Ok(())
+}
+
+async fn run_standard_receiver(_bind_ip: IpAddr, ports: Vec<u16>, args: &Args) -> Result<()> {
+    info!("Using standard receiver implementation");
     
     // Setup statistics tracking
     let stats = Arc::new(Mutex::new(HashMap::new()));
@@ -396,4 +486,82 @@ fn main() -> Result<()> {
     print_statistics(&stats);
 
     Ok(())
+}
+
+/// Print flux-optimized statistics
+fn print_flux_statistics(current: &ReceiverStatistics, last: &ReceiverStatistics, elapsed: f64) {
+    println!("\n=== FLUX-OPTIMIZED CBOE Receiver Statistics ===");
+    
+    // Calculate rates
+    let packet_rate = ((current.total_received - last.total_received) as f64 / elapsed).round() as u64;
+    let byte_rate = ((current.total_bytes - last.total_bytes) as f64 / elapsed).round() as u64;
+    let mb_rate = byte_rate as f64 / (1024.0 * 1024.0);
+    
+    println!("Overall Performance:");
+    println!("  Total Received: {} packets ({} bytes)", current.total_received, current.total_bytes);
+    println!("  Rate: {} pps, {:.2} MB/s", packet_rate, mb_rate);
+    println!("  Processed: {} packets", current.total_processed);
+    println!("  Errors: {}", current.errors);
+    
+    println!("\nSequence Analysis:");
+    println!("  Gaps: {}, Duplicates: {}, Out-of-Order: {}", 
+             current.sequence_gaps, current.duplicates, current.out_of_order);
+    
+    println!("\nFlux Optimizations:");
+    println!("  Ring Buffer Utilization: {:.1}%", current.ring_buffer_utilization);
+    println!("  Memory Pool Efficiency: {:.1}%", current.memory_pool_efficiency);
+    println!("  Batch Size: {}, SIMD: {}", current.batch_size, current.simd_enabled);
+    
+    println!("\nPer-Port Statistics (with Performance Metrics):");
+    println!("{:<8} {:<12} {:<12} {:<8} {:<8} {:<8} {:<12} {:<12}", 
+             "Port", "Packets", "Bytes", "Gaps", "Dups", "OOO", "Avg PPS", "Peak PPS");
+    println!("{}", "─".repeat(90));
+    
+    for (port, port_stats) in &current.port_statistics {
+        println!("{:<8} {:<12} {:<12} {:<8} {:<8} {:<8} {:<12.0} {:<12.0}",
+                port,
+                port_stats.packets_received,
+                port_stats.bytes_received,
+                port_stats.gaps_detected,
+                port_stats.duplicates,
+                port_stats.out_of_order,
+                port_stats.avg_throughput_pps,
+                port_stats.peak_throughput_pps);
+        
+        // Show performance percentiles
+        if port_stats.packets_received > 100 {
+            println!("    ├─ Latency (μs): p50={} p55={} p95={} p99={} max={}",
+                    port_stats.latency_p50_us,
+                    port_stats.latency_p55_us,
+                    port_stats.latency_p95_us,
+                    port_stats.latency_p99_us,
+                    port_stats.latency_max_us);
+            println!("    ├─ Processing (ns): p50={} p55={} p95={} p99={} max={}",
+                    port_stats.processing_p50_ns,
+                    port_stats.processing_p55_ns,
+                    port_stats.processing_p95_ns,
+                    port_stats.processing_p99_ns,
+                    port_stats.processing_max_ns);
+        }
+        
+        // Show unit sequences for detailed analysis
+        if !port_stats.unit_sequences.is_empty() {
+            for (unit, seq) in &port_stats.unit_sequences {
+                println!("    └─ Unit {}: sequence {}", unit, seq);
+            }
+        }
+    }
+}
+
+/// Print final flux-optimized statistics
+fn print_final_flux_statistics(stats: &ReceiverStatistics, total_time: f64) {
+    println!("\n=== FINAL FLUX-OPTIMIZED STATISTICS ===");
+    println!("Total Runtime: {:.2} seconds", total_time);
+    println!("Total Packets: {}", stats.total_received);
+    println!("Total Bytes: {} ({:.2} MB)", stats.total_bytes, stats.total_bytes as f64 / (1024.0 * 1024.0));
+    println!("Average Rate: {:.0} pps", stats.total_received as f64 / total_time);
+    println!("Sequence Issues: {} gaps, {} duplicates, {} out-of-order", 
+             stats.sequence_gaps, stats.duplicates, stats.out_of_order);
+    println!("Final Ring Buffer Utilization: {:.1}%", stats.ring_buffer_utilization);
+    println!("Final Memory Pool Efficiency: {:.1}%", stats.memory_pool_efficiency);
 }

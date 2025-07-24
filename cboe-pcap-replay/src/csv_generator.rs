@@ -68,12 +68,12 @@ struct OrderBook {
 #[derive(Debug, Clone)]
 struct Order {
     order_id: String,
-    symbol: String,
-    side: char,
+    _symbol: String,
+    _side: char,
     quantity: u32,
-    price: u64,
-    participant_id: String,
-    timestamp: u64,
+    _price: u64,
+    _participant_id: String,
+    _timestamp: u64,
 }
 
 struct SequenceTracker {
@@ -311,12 +311,12 @@ pub fn generate_csv(
 
                 let order = Order {
                     order_id: order_id.clone(),
-                    symbol: symbol.to_string(),
-                    side,
+                    _symbol: symbol.to_string(),
+                    _side: side,
                     quantity,
-                    price,
-                    participant_id: participant_id.clone(),
-                    timestamp: current_time_ns,
+                    _price: price,
+                    _participant_id: participant_id.clone(),
+                    _timestamp: current_time_ns,
                 };
 
                 let mut record = create_empty_record();

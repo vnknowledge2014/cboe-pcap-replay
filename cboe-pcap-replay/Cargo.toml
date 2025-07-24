@@ -26,9 +26,32 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 byteorder = "1.5"
 pcap-file = "2.0"
+# Flux-inspired high-performance additions
+memmap2 = "0.9"
+smallvec = "1.11"
+arrayvec = "0.7"
+atomic = "0.6"
+flume = "0.11"
+rayon = "1.8"
+# SIMD and memory optimizations
+wide = "0.7"
+# Additional performance dependencies
+jemallocator = { version = "0.5", optional = true }
+mimalloc = { version = "0.1", optional = true }
+lazy_static = "1.4"
+libc = "0.2"
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
 opt-level = 3
+debug = false
+overflow-checks = false
+incremental = false
+
+[features]
+default = []
+jemalloc = ["dep:jemallocator"]
+mimalloc = ["dep:mimalloc"]
+simd = []
