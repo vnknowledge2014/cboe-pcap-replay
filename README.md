@@ -204,8 +204,8 @@ Các file thực thi đã biên dịch sẽ có sẵn trong thư mục `target/r
 
 ## Tài liệu công cụ
 
-- [CBOE PCAP Replayer](cboe-pcap-replay/README.md) - Công cụ tích hợp hoàn chỉnh (tạo, chuyển đổi, phát lại)
-- [CBOE PCAP Receiver](cboe-pcap-receiver/README.md) - Giám sát việc nhận gói tin
+- [CBOE PCAP Replayer] - Công cụ tích hợp hoàn chỉnh (tạo, chuyển đổi, phát lại)
+- [CBOE PCAP Receiver] - Giám sát việc nhận gói tin
 
 ## Hỗ trợ thông điệp CBOE PITCH
 

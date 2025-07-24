@@ -156,11 +156,34 @@ impl ZeroCopyTransport {
             }
             
             if !iovecs.is_empty() {
+                #[cfg(target_os = "macos")]
                 let msg = msghdr {
                     msg_name: &self.target_addr as *const _ as *mut libc::c_void,
                     msg_namelen: std::mem::size_of::<SocketAddr>() as u32,
                     msg_iov: iovecs.as_mut_ptr(),
-                    msg_iovlen: iovecs.len(),  // Sử dụng kiểu mặc định của trường này
+                    msg_iovlen: iovecs.len() as i32,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                };
+                
+                #[cfg(target_os = "linux")]
+                let msg = msghdr {
+                    msg_name: &self.target_addr as *const _ as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<SocketAddr>() as u32,
+                    msg_iov: iovecs.as_mut_ptr(),
+                    msg_iovlen: iovecs.len(),
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                };
+                
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let msg = msghdr {
+                    msg_name: &self.target_addr as *const _ as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<SocketAddr>() as u32,
+                    msg_iov: iovecs.as_mut_ptr(),
+                    msg_iovlen: iovecs.len() as i32,
                     msg_control: std::ptr::null_mut(),
                     msg_controllen: 0,
                     msg_flags: 0,
