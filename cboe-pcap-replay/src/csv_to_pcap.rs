@@ -289,7 +289,7 @@ fn encode_pitch_message(record: &CsvRecord) -> Result<Vec<u8>> {
         }
         0x2D => {
             // End of Session message (6 bytes total)
-            // Reserved (4 bytes)
+            // Reserved (4 bytes) - per CBOE spec
             message.write_u32::<LittleEndian>(0).unwrap();
         }
         0x59 => {
@@ -358,14 +358,14 @@ fn encode_pitch_message(record: &CsvRecord) -> Result<Vec<u8>> {
             }
         }
         0x3E => {
-            // Trade Break message (17 bytes total)
-            if let (Some(original_execution_id), Some(break_reason)) = 
-                (&record.original_execution_id, &record.break_reason) {
+            // Trade Break message (18 bytes total)
+            if let (Some(execution_id), Some(break_reason)) = 
+                (&record.execution_id, &record.break_reason) {
                 
                 // Timestamp (8 bytes)
                 message.write_u64::<LittleEndian>(record.timestamp_ns).unwrap();
-                // Original Execution ID (8 bytes)
-                message.extend_from_slice(&encode_base36_execution_id(original_execution_id));
+                // Execution ID (8 bytes) - ID of the execution being broken
+                message.extend_from_slice(&encode_base36_execution_id(execution_id));
                 // Break Reason (1 byte)
                 message.push(break_reason.chars().next().unwrap_or('E') as u8);
             } else {
@@ -374,7 +374,7 @@ fn encode_pitch_message(record: &CsvRecord) -> Result<Vec<u8>> {
         }
         0x97 => {
             // Unit Clear message (6 bytes total)
-            // Reserved (4 bytes)
+            // Reserved (4 bytes) - per CBOE spec
             message.write_u32::<LittleEndian>(0).unwrap();
         }
         _ => {

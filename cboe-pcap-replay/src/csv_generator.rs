@@ -63,6 +63,7 @@ struct OrderBook {
     orders: HashMap<String, Order>,
     next_order_id: u64,
     next_execution_id: u64,
+    execution_history: Vec<String>, // Track execution IDs for trade breaks
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,7 @@ impl OrderBook {
             orders: HashMap::new(),
             next_order_id: 1,
             next_execution_id: 1,
+            execution_history: Vec::new(),
         }
     }
 
@@ -112,7 +114,15 @@ impl OrderBook {
     fn next_execution_id(&mut self) -> String {
         let id = format!("{:09}", to_base36(self.next_execution_id));
         self.next_execution_id += 1;
+        self.execution_history.push(id.clone());
         id
+    }
+
+    fn get_random_execution_id(&self, rng: &mut ThreadRng) -> Option<String> {
+        if self.execution_history.is_empty() {
+            return None;
+        }
+        self.execution_history.choose(rng).cloned()
     }
 
     fn add_order(&mut self, order: Order) {
@@ -233,7 +243,7 @@ pub fn generate_csv(
 ) -> Result<()> {
     let symbols: Vec<&str> = symbols.split(',').collect();
     
-    info!("Starting CBOE PITCH CSV generation (Official Specification Compliant)");
+    info!("Starting CBOE PITCH CSV generation (Realistic Trading Session)");
     info!("Symbols: {:?}", symbols);
     info!("Duration: {} seconds", duration);
     info!("Output file: {}", output);
@@ -252,8 +262,11 @@ pub fn generate_csv(
     let start_time = Utc::now();
     let mut current_time_ns = start_time.timestamp_nanos_opt().unwrap() as u64;
     let end_time_ns = current_time_ns + (duration * 1_000_000_000);
+    let session_duration = duration * 1_000_000_000;
+    let pre_open_end = current_time_ns + (session_duration / 10); // 10% pre-open
+    let continuous_end = current_time_ns + (session_duration * 9 / 10); // 90% continuous
 
-    info!("Generating market data from {} to {}", start_time, 
+    info!("Generating realistic trading session from {} to {}", start_time, 
           DateTime::from_timestamp_nanos(end_time_ns as i64));
 
     let participants = vec!["ARCA", "BATS", "EDGX", "NSDQ", "NYSE", "CBOE"];
@@ -261,7 +274,86 @@ pub fn generate_csv(
     
     let mut message_count = 0u64;
 
-    // Generate Trading Status messages for market open (0x3B)
+    // PHASE 1: PRE-OPEN - Trading Status (Halt) + Auction Updates
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        // Trading Status: Halt (H)
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x3B".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 22;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 22;
+        record.trading_status = Some('H'); // Halt before open
+        record.market_id_code = Some(market_id_codes.choose(&mut rng).unwrap().to_string());
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 100_000; // 0.1ms
+    }
+
+    // Pre-open auction updates
+    while current_time_ns < pre_open_end {
+        for symbol in &symbols {
+            let unit = (message_count % units as u64) as u8 + 1;
+            let port_num = port + (unit - 1) as u16;
+            let sequence = sequence_tracker.next_sequence(unit);
+            
+            // Auction Update (0x59)
+            let mut record = create_empty_record();
+            record.timestamp_ns = current_time_ns;
+            record.message_type = "0x59".to_string();
+            record.port = port_num;
+            record.symbol = format!("{:<6}", symbol);
+            record.hdr_length = 16 + 34;
+            record.hdr_count = 1;
+            record.hdr_unit = unit;
+            record.hdr_sequence = sequence;
+            record.msg_length = 34;
+            record.auction_type = Some('O'); // Opening auction
+            record.buy_shares = Some(rng.gen_range(1000..50000));
+            record.sell_shares = Some(rng.gen_range(1000..50000));
+            record.indicative_price = Some(price_to_cboe_format(generate_realistic_price(symbol, &mut rng)));
+            
+            writer.serialize(&record)?;
+            message_count += 1;
+            current_time_ns += rng.gen_range(1_000_000..5_000_000); // 1-5ms
+        }
+    }
+
+    // Auction Summary before market open
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x5A".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 30;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 30;
+        record.auction_type = Some('O'); // Opening auction
+        record.auction_price = Some(price_to_cboe_format(generate_realistic_price(symbol, &mut rng)));
+        record.auction_shares = Some(rng.gen_range(5000..25000));
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 100_000;
+    }
+
+    // PHASE 2: MARKET OPEN - Trading Status (Trading)
     for symbol in &symbols {
         let unit = (message_count % units as u64) as u8 + 1;
         let port_num = port + (unit - 1) as u16;
@@ -272,7 +364,7 @@ pub fn generate_csv(
         record.message_type = "0x3B".to_string();
         record.port = port_num;
         record.symbol = format!("{:<6}", symbol);
-        record.hdr_length = 16 + 22; // Header + message length
+        record.hdr_length = 16 + 22;
         record.hdr_count = 1;
         record.hdr_unit = unit;
         record.hdr_sequence = sequence;
@@ -282,11 +374,11 @@ pub fn generate_csv(
         
         writer.serialize(&record)?;
         message_count += 1;
-        current_time_ns += rng.gen_range(100_000..1_000_000);
+        current_time_ns += 100_000;
     }
 
-    // Generate market data messages
-    while current_time_ns < end_time_ns {
+    // PHASE 3: CONTINUOUS TRADING - Realistic order lifecycle
+    while current_time_ns < continuous_end {
         let symbol = symbols.choose(&mut rng).unwrap();
         let unit = (message_count % units as u64) as u8 + 1;
         let port_num = port + (unit - 1) as u16;
@@ -471,8 +563,8 @@ pub fn generate_csv(
             message_count += 1;
         }
 
-        // Occasionally generate Order Executed at Price messages (0x58) for auctions
-        if rng.gen_range(0..200) < 1 { // 0.5% chance
+        // Generate Order Executed at Price messages (0x58) for auction executions
+        if rng.gen_range(0..200) < 1 { // 0.5% chance - auction execution
             if let Some(order) = order_book.get_random_order(&mut rng).cloned() {
                 let executed_quantity = std::cmp::min(order.quantity, rng.gen_range(100..order.quantity + 1));
                 let execution_id = order_book.next_execution_id();
@@ -483,11 +575,11 @@ pub fn generate_csv(
                 record.message_type = "0x58".to_string();
                 record.port = port_num;
                 record.symbol = format!("{:<6}", symbol);
-                record.hdr_length = 16 + 29; // Header + message length
+                record.hdr_length = 16 + 52; // Header + message length (per spec)
                 record.hdr_count = 1;
                 record.hdr_unit = unit;
                 record.hdr_sequence = sequence_tracker.next_sequence(unit);
-                record.msg_length = 29;
+                record.msg_length = 52; // Per CBOE spec
                 record.order_id = Some(order.order_id.clone());
                 record.executed_quantity = Some(executed_quantity);
                 record.execution_id = Some(execution_id);
@@ -504,29 +596,31 @@ pub fn generate_csv(
 
         // Occasionally generate Trade Break messages (0x3E)
         if rng.gen_range(0..5000) < 1 { // 0.02% chance
-            let original_execution_id = format!("{:09}", to_base36(rng.gen_range(1..1000000)));
-            let break_reasons = ['E', 'C', 'D']; // Error, Consent, Duplicate
-            let break_reason = *break_reasons.choose(&mut rng).unwrap();
+            // Only generate trade break if we have execution history
+            if let Some(execution_id) = order_book.get_random_execution_id(&mut rng) {
+                let break_reasons = ['E', 'C', 'D']; // Error, Consent, Duplicate
+                let break_reason = *break_reasons.choose(&mut rng).unwrap();
 
-            let mut record = create_empty_record();
-            record.timestamp_ns = current_time_ns;
-            record.message_type = "0x3E".to_string();
-            record.port = port_num;
-            record.symbol = format!("{:<6}", symbol);
-            record.hdr_length = 16 + 17; // Header + message length
-            record.hdr_count = 1;
-            record.hdr_unit = unit;
-            record.hdr_sequence = sequence_tracker.next_sequence(unit);
-            record.msg_length = 17;
-            record.original_execution_id = Some(original_execution_id);
-            record.break_reason = Some(break_reason);
+                let mut record = create_empty_record();
+                record.timestamp_ns = current_time_ns;
+                record.message_type = "0x3E".to_string();
+                record.port = port_num;
+                record.symbol = format!("{:<6}", symbol);
+                record.hdr_length = 16 + 18; // Header + message length (per spec)
+                record.hdr_count = 1;
+                record.hdr_unit = unit;
+                record.hdr_sequence = sequence_tracker.next_sequence(unit);
+                record.msg_length = 18; // Per CBOE spec
+                record.execution_id = Some(execution_id); // Execution ID being broken
+                record.break_reason = Some(break_reason);
 
-            writer.serialize(&record)?;
-            message_count += 1;
+                writer.serialize(&record)?;
+                message_count += 1;
+            }
         }
 
-        // Occasionally generate Calculated Value messages (0xE3)
-        if rng.gen_range(0..1000) < 1 { // 0.1% chance
+        // Occasionally generate intraday Calculated Value messages (0xE3)
+        if rng.gen_range(0..2000) < 1 { // 0.05% chance - rare during trading
             let value = price_to_cboe_format(generate_realistic_price(symbol, &mut rng));
 
             let mut record = create_empty_record();
@@ -534,12 +628,12 @@ pub fn generate_csv(
             record.message_type = "0xE3".to_string();
             record.port = port_num;
             record.symbol = format!("{:<6}", symbol);
-            record.hdr_length = 16 + 33; // Header + message length
+            record.hdr_length = 16 + 33;
             record.hdr_count = 1;
             record.hdr_unit = unit;
             record.hdr_sequence = sequence_tracker.next_sequence(unit);
             record.msg_length = 33;
-            record.value_category = Some('1'); // Closing price
+            record.value_category = Some('2'); // Intraday value
             record.value = Some(value);
             record.value_timestamp = Some(current_time_ns);
 
@@ -555,27 +649,132 @@ pub fn generate_csv(
         }
     }
 
-    // Generate Unit Clear messages (0x97) occasionally for recovery scenarios
-    if rng.gen_range(0..10) == 0 { // 10% chance per session
+    // PHASE 4: PRE-CLOSE AUCTION
+    current_time_ns = continuous_end;
+    
+    // Pre-close auction updates
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        // Auction Update (0x59) - Pre-close
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x59".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 34;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 34;
+        record.auction_type = Some('C'); // Closing auction
+        record.buy_shares = Some(rng.gen_range(1000..30000));
+        record.sell_shares = Some(rng.gen_range(1000..30000));
+        record.indicative_price = Some(price_to_cboe_format(generate_realistic_price(symbol, &mut rng)));
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 500_000; // 0.5ms
+    }
+
+    // Auction Summary for close
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x5A".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 30;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 30;
+        record.auction_type = Some('C'); // Closing auction
+        record.auction_price = Some(price_to_cboe_format(generate_realistic_price(symbol, &mut rng)));
+        record.auction_shares = Some(rng.gen_range(3000..15000));
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 100_000;
+    }
+
+    // PHASE 5: MARKET CLOSE - Trading Status (Close)
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0x3B".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 22;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 22;
+        record.trading_status = Some('C'); // Closed
+        record.market_id_code = Some(market_id_codes.choose(&mut rng).unwrap().to_string());
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 100_000;
+    }
+
+    // Generate Calculated Values (0xE3) - End of day values
+    for symbol in &symbols {
+        let unit = (message_count % units as u64) as u8 + 1;
+        let port_num = port + (unit - 1) as u16;
+        let sequence = sequence_tracker.next_sequence(unit);
+        
+        let mut record = create_empty_record();
+        record.timestamp_ns = current_time_ns;
+        record.message_type = "0xE3".to_string();
+        record.port = port_num;
+        record.symbol = format!("{:<6}", symbol);
+        record.hdr_length = 16 + 33;
+        record.hdr_count = 1;
+        record.hdr_unit = unit;
+        record.hdr_sequence = sequence;
+        record.msg_length = 33;
+        record.value_category = Some('1'); // Closing price
+        record.value = Some(price_to_cboe_format(generate_realistic_price(symbol, &mut rng)));
+        record.value_timestamp = Some(current_time_ns);
+        
+        writer.serialize(&record)?;
+        message_count += 1;
+        current_time_ns += 100_000;
+    }
+
+    // Generate Unit Clear messages (0x97) if needed for recovery
+    if rng.gen_range(0..20) == 0 { // 5% chance - rare recovery event
         for unit_num in 1..=units {
             let mut record = create_empty_record();
             record.timestamp_ns = current_time_ns;
             record.message_type = "0x97".to_string();
             record.port = port + (unit_num - 1) as u16;
-            record.symbol = format!("{:<6}", "      "); // No specific symbol for unit clear
-            record.hdr_length = 16 + 6; // Header + message length
+            record.symbol = format!("{:<6}", "      ");
+            record.hdr_length = 16 + 6; // Header + message length (per spec)
             record.hdr_count = 1;
             record.hdr_unit = unit_num;
             record.hdr_sequence = sequence_tracker.next_sequence(unit_num);
-            record.msg_length = 6;
+            record.msg_length = 6; // Per CBOE spec
 
             writer.serialize(&record)?;
             message_count += 1;
-            current_time_ns += rng.gen_range(10_000..100_000);
+            current_time_ns += 100_000;
         }
     }
 
-    // Generate End of Session messages (0x2D)
+    // PHASE 6: END OF SESSION - MANDATORY
+    current_time_ns = end_time_ns;
     for symbol in &symbols {
         let unit = (message_count % units as u64) as u8 + 1;
         let port_num = port + (unit - 1) as u16;
@@ -586,15 +785,15 @@ pub fn generate_csv(
         record.message_type = "0x2D".to_string();
         record.port = port_num;
         record.symbol = format!("{:<6}", symbol);
-        record.hdr_length = 16 + 6; // Header + message length
+        record.hdr_length = 16 + 6; // Header + message length (per spec)
         record.hdr_count = 1;
         record.hdr_unit = unit;
         record.hdr_sequence = sequence;
-        record.msg_length = 6;
+        record.msg_length = 6; // Per CBOE spec
 
         writer.serialize(&record)?;
         message_count += 1;
-        current_time_ns += rng.gen_range(100_000..1_000_000);
+        current_time_ns += 1_000_000;
     }
 
     writer.flush()?;
@@ -604,8 +803,8 @@ pub fn generate_csv(
     info!("                        Order Executed at Price (0x58), Reduce Size (0x39), Modify Order (0x3A)");
     info!("                        Delete Order (0x3C), Trade (0x3D), Trade Break (0x3E)");
     info!("                        Auction Update (0x59), Auction Summary (0x5A), Unit Clear (0x97)");
-    info!("                        Calculated Value (0xE3), End of Session (0x2D)");
-    info!("CSV file written to: {}", output);
+    info!("                        Calculated Value (0xE3), End of Session (0x2D) - MANDATORY");
+    info!("CSV file written to: {} with End of Session messages", output);
     
     Ok(())
 }
