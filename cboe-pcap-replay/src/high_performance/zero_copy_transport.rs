@@ -160,7 +160,10 @@ impl ZeroCopyTransport {
                     msg_name: &self.target_addr as *const _ as *mut libc::c_void,
                     msg_namelen: std::mem::size_of::<SocketAddr>() as u32,
                     msg_iov: iovecs.as_mut_ptr(),
+                    #[cfg(target_os = "linux")]
                     msg_iovlen: iovecs.len() as libc::c_uint,
+                    #[cfg(not(target_os = "linux"))]
+                    msg_iovlen: iovecs.len() as i32,
                     msg_control: std::ptr::null_mut(),
                     msg_controllen: 0,
                     msg_flags: 0,
